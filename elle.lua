@@ -240,7 +240,7 @@ local function setup_params()
   params:add_separator() -- Separator before groups
 
   -- ======================== SLOT 1 PARAMETERS ========================
-  local slot1_param_count = 20 -- Manually count params added below
+  local slot1_param_count = 21 -- Incremented count
   params:add_group("slot1", "Slot 1 Settings", slot1_param_count)
   do -- Use a block to scope local i = 1
     local i = 1
@@ -261,7 +261,9 @@ local function setup_params()
 
     -- Unique ID: sid.."volume", Label: "volume"
     params:add_taper(sid.."volume", "volume", -60, 20, 0, 0, "dB")
-    params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end) -- Use dbamp helper
+    params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
+    params:add_control(sid.."pan", "pan", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, "", 0.01))
+    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
 
     -- Unique ID: sid.."jitter", Label: "jitter"
     params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
@@ -277,9 +279,7 @@ local function setup_params()
 
     -- Unique ID: sid.."pitch", Label: "pitch"
     params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
-    -- FIX: Use math.pow for semitone to ratio conversion
     params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
-
     -- Unique ID: sid.."spread", Label: "spread"
     params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
     params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
@@ -371,7 +371,7 @@ local function setup_params()
   end -- End of Slot 1 block
 
   -- ======================== SLOT 2 PARAMETERS ========================
-  local slot2_param_count = 20
+  local slot2_param_count = 21 -- Incremented count
   params:add_group("slot2", "Slot 2 Settings", slot2_param_count)
   do -- Use a block to scope local i = 2
     local i = 2
@@ -385,6 +385,7 @@ local function setup_params()
     params:set_action(sid.."playhead_direction", function() update_playhead(i) end)
     params:add_taper(sid.."volume", "volume", -60, 20, -60, 0, "dB") -- Default -60
     params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
+    params:add_control(sid.."pan", "pan", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, "", 0.01))
     params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
     params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
     params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
@@ -392,8 +393,8 @@ local function setup_params()
     params:add_taper(sid.."density", "density", 0, 512, 20, 6, "hz")
     params:set_action(sid.."density", function(v) engine.density(i, v) end)
     params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
-    -- FIX: Use math.pow for semitone to ratio conversion
     params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
+    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
     params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
     params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
     params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
@@ -422,7 +423,7 @@ local function setup_params()
 
 
   -- ======================== SLOT 3 PARAMETERS ========================
-  local slot3_param_count = 20
+  local slot3_param_count = 21 -- Incremented count
   params:add_group("slot3", "Slot 3 Settings", slot3_param_count)
   do -- Use a block to scope local i = 3
     local i = 3
@@ -436,6 +437,7 @@ local function setup_params()
     params:set_action(sid.."playhead_direction", function() update_playhead(i) end)
     params:add_taper(sid.."volume", "volume", -60, 20, -60, 0, "dB") -- Default -60
     params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
+    params:add_control(sid.."pan", "pan", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, "", 0.01))
     params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
     params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
     params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
@@ -443,8 +445,8 @@ local function setup_params()
     params:add_taper(sid.."density", "density", 0, 512, 20, 6, "hz")
     params:set_action(sid.."density", function(v) engine.density(i, v) end)
     params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
-    -- FIX: Use math.pow for semitone to ratio conversion
     params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
+    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
     params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
     params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
     params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
@@ -543,6 +545,7 @@ local function setup_params()
   params:bang() -- Trigger initial actions for all params
 end
 
+-- (Rest of the script remains the same)
 ----------------------------------------------------------------
 -- 7) RANDOMIZE LOGIC
 ----------------------------------------------------------------
