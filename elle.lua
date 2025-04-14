@@ -1,6 +1,5 @@
 -- |_ (Elle)
 -- by @nzimas
---
 
 engine.name = "Elle"
 
@@ -8,7 +7,7 @@ engine.name = "Elle"
 -- 1) GLOBALS & HELPERS
 ----------------------------------------------------------------
 
-local ui_mode = "main"     -- "main" or "sample_select"
+local ui_mode = "main"      -- "main" or "sample_select"
 
 -- "browse_root" (set via param) determines the root folder; default is _path.audio.
 local root_dir = _path.audio
@@ -19,6 +18,57 @@ local item_list = {}
 local item_idx = 1
 local slot_idx = 1
 
+-- Ping-pong logic for playhead direction
+local pingpong_metros = {nil, nil, nil}
+local pingpong_sign = {1, 1, 1}
+
+-- Geometry for main UI squares
+local square_size = 30
+local square_y = 15
+local square_x = {10, 49, 88}
+
+local ui_metro
+local random_seek_metros = {nil, nil, nil}
+
+local key1_hold = false -- Still used for K1 randomize? No, simplified.
+local key2_hold = false -- Used only for K2 long press detection
+local key3_hold = false -- Not used currently
+
+-- Scale & pitch randomization info
+local scale_options = {"dorian", "natural minor", "harmonic minor", "melodic minor", "major", "locrian", "phrygian"}
+local scales = {
+  dorian = {0, 2, 3, 5, 7, 9, 10},
+  ["natural minor"] = {0, 2, 3, 5, 7, 8, 10},
+  ["harmonic minor"] = {0, 2, 3, 5, 7, 8, 11},
+  ["melodic minor"] = {0, 2, 3, 5, 7, 9, 11},
+  major = {0, 2, 4, 5, 7, 9, 11},
+  locrian = {0, 1, 3, 5, 6, 8, 10},
+  phrygian = {0, 1, 3, 5, 7, 8, 10}
+}
+
+-- Morph time options
+local morph_time_options = {}
+for t = 0, 90000, 500 do
+  table.insert(morph_time_options, t)
+end
+
+-- LFO Configuration
+local lfo_target_param_names = {
+  "volume", "pan", "jitter", "size", "density",
+  "pitch", "spread", "fade", "seek",
+  "filter_cutoff", "filter_q"
+  -- Note: Add global params here if desired later (e.g., "delay_time_l")
+}
+local lfo_shape_names = {"sine", "tri", "saw", "sqr", "random"}
+
+-- Metronomes for LFOs
+local lfo_metro = nil
+-- Storage for current LFO phases (0-1) and values (-1 to 1)
+local lfo_phases = {{0}, {0}, {0}, {0}}
+local lfo_values = {0, 0, 0, 0}
+local LFO_METRO_RATE = 1/30 -- Update LFOs 30 times per second
+
+-- Helper Functions
 local function file_dir_name(fp)
   local d = string.match(fp, "^(.*)/[^/]*$")
   return d or fp
@@ -41,42 +91,20 @@ local function is_dir(path)
      string.match(lower, "%.flac$") then
     return false
   end
-  local ok, items = pcall(util.scandir, path)
-  return (ok and items ~= nil)
+  -- Use standard Norns util check - check file exists AND scandir returns a table (not nil/error)
+  return util.file_exists(path) and (type(util.scandir(path)) == 'table')
 end
 
--- Ping-pong logic for playhead direction
-local pingpong_metros = {nil, nil, nil}
-local pingpong_sign = {1, 1, 1}
-
--- Geometry for main UI squares
-local square_size = 30
-local square_y = 15
-local square_x = {10, 49, 88}
-
-local ui_metro
-local random_seek_metros = {nil, nil, nil}
-
-local key1_hold = false
-local key2_hold = false
-local key3_hold = false
-
--- Scale & pitch randomization info
-local scale_options = {"dorian", "natural minor", "harmonic minor", "melodic minor", "major", "locrian", "phrygian"}
-local scales = {
-  dorian = {0, 2, 3, 5, 7, 9, 10},
-  ["natural minor"] = {0, 2, 3, 5, 7, 8, 10},
-  ["harmonic minor"] = {0, 2, 3, 5, 7, 8, 11},
-  ["melodic minor"] = {0, 2, 3, 5, 7, 9, 11},
-  major = {0, 2, 4, 5, 7, 9, 11},
-  locrian = {0, 1, 3, 5, 6, 8, 10},
-  phrygian = {0, 1, 3, 5, 7, 8, 10}
-}
-
--- We only use morph_time (no transitions)
-local morph_time_options = {}
-for t = 0, 90000, 500 do
-  table.insert(morph_time_options, t)
+-- Triangle wave function (0-1 phase -> -1 to 1 value)
+local function tri_wave(phase)
+  phase = phase % 1.0 -- Ensure phase is within 0-1
+  if phase < 0.25 then
+    return phase * 4.0 -- Rising from 0 to 1
+  elseif phase < 0.75 then
+    return 1.0 - (phase - 0.25) * 4.0 -- Falling from 1 to -1
+  else
+    return -1.0 + (phase - 0.75) * 4.0 -- Rising from -1 to 0
+  end
 end
 
 ----------------------------------------------------------------
@@ -91,16 +119,29 @@ local function setup_ui_metro()
 end
 
 local function smooth_transition(param_name, new_val, duration)
+  -- Ensure duration is positive
+  if duration <= 0 then
+    params:set(param_name, new_val)
+    return
+  end
   clock.run(function()
     local start_val = params:get(param_name)
-    local steps = 60
+    -- Avoid transition if start and end are the same or param not found
+    if start_val == nil or start_val == new_val then
+        if start_val == nil then print("smooth_transition warning: param not found - " .. param_name) end
+        return
+    end
+
+    local steps = math.max(1, math.floor(duration * 60)) -- Aim for ~60 steps per second
     local dt = duration / steps
     for i = 1, steps do
       local t = i / steps
+      -- Basic linear interpolation
       local interp = start_val + (new_val - start_val) * t
-      params:set(param_name, interp)
+      params:set(param_name, interp) -- Assume param exists if start_val was not nil
       clock.sleep(dt)
     end
+    -- Final set to ensure exact value
     params:set(param_name, new_val)
   end)
 end
@@ -111,107 +152,209 @@ end
 
 local function list_dir_contents(dir)
   local items = {}
-  if dir ~= root_dir and dir ~= "/" then
-    table.insert(items, {type = "up", name = "[..]", path = file_dir_name(dir)})
-  end
-  local ok, listing = pcall(util.scandir, dir)
-  if not ok or not listing then
-    return {{type = "none", name = "(empty or error)", path = dir}}
-  end
-  -- Subdirectories first
-  for _, f in ipairs(listing) do
-    local p = dir .. "/" .. f
-    if file_exists(p) and is_dir(p) then
-      table.insert(items, {type = "dir", name = f, path = p})
+  -- Add '..' navigation option if not in root
+  if dir ~= root_dir and dir ~= "/" and dir ~= nil and dir ~= "" then
+    local parent_dir = file_dir_name(dir)
+    -- Ensure parent isn't below root_dir somehow (basic check)
+    if parent_dir and (#parent_dir <= #root_dir or root_dir == _path.audio) and (#parent_dir < #dir or dir=="/") then
+         table.insert(items, {type = "up", name = "[..]", path = parent_dir})
     end
   end
-  -- Then audio files
+
+  local ok, listing = pcall(util.scandir, dir)
+  if not ok or not listing then
+    print("Error scanning directory: " .. tostring(dir))
+    return {{type = "none", name = "(empty or error)", path = dir}}
+  end
+
+  local dirs = {}
+  local files = {}
+
+  -- Separate files and directories
   for _, f in ipairs(listing) do
-    local p = dir .. "/" .. f
-    if file_exists(p) and not is_dir(p) then
-      local lower = string.lower(f)
-      if string.match(lower, "%.wav$") or string.match(lower, "%.aif$") or
-         string.match(lower, "%.aiff$") or string.match(lower, "%.flac$") then
-        table.insert(items, {type = "file", name = f, path = p})
+    -- Ignore hidden files/dirs
+    if string.sub(f, 1, 1) ~= '.' then
+      local p = dir .. "/" .. f
+      if file_exists(p) then -- Check existence (scandir might list broken links)
+        if is_dir(p) then
+          table.insert(dirs, {type = "dir", name = f, path = p})
+        else
+          local lower = string.lower(f)
+          if string.match(lower, "%.wav$") or string.match(lower, "%.aif$") or
+               string.match(lower, "%.aiff$") or string.match(lower, "%.flac$") then
+            table.insert(files, {type = "file", name = f, path = p})
+          end
+        end
       end
     end
   end
-  if #items < 1 then
-    table.insert(items, {type = "none", name = "(no subdirs or audio)", path = dir})
+
+  -- Sort directories and files alphabetically (case-insensitive)
+  table.sort(dirs, function(a, b) return string.lower(a.name) < string.lower(b.name) end)
+  table.sort(files, function(a, b) return string.lower(a.name) < string.lower(b.name) end)
+
+  -- Combine lists: '..' then directories, then files
+  for _, d in ipairs(dirs) do table.insert(items, d) end
+  for _, f in ipairs(files) do table.insert(items, f) end
+
+  -- Handle empty directory case (only contains '..' or nothing)
+  if #items == 0 then
+       table.insert(items, {type = "none", name = "(empty)", path = dir})
+  elseif #items == 1 and items[1].type == "up" then
+       table.insert(items, {type = "none", name = "(empty)", path = dir})
   end
+
   return items
 end
+
 
 ----------------------------------------------------------------
 -- 4) PLAYHEAD / PING-PONG LOGIC
 ----------------------------------------------------------------
 
 local function update_playhead(i)
-  local rate = params:get(i.."playhead_rate")
-  local dir = params:get(i.."playhead_direction")
+  local rate_param_id = i.."playhead_rate"
+  local dir_param_id = i.."playhead_direction"
+
+  -- Get parameter values, check if they exist (return nil if not found)
+  local rate = params:get(rate_param_id)
+  local dir = params:get(dir_param_id)
+
+  -- Exit if parameters don't exist (e.g., during script load/init issues)
+  if rate == nil then
+    -- print("Warning: param " .. rate_param_id .. " not found in update_playhead.")
+    return
+  end
+    if dir == nil then
+    -- print("Warning: param " .. dir_param_id .. " not found in update_playhead.")
+    return
+  end
+
+  -- Stop existing metro for this slot if it exists
   if pingpong_metros[i] then
     pingpong_metros[i]:stop()
     pingpong_metros[i] = nil
-    pingpong_sign[i] = 1
   end
-  if dir == 1 then
+  pingpong_sign[i] = 1 -- Reset direction sign
+
+  if dir == 1 then -- Forward (Option index 1)
     engine.speed(i, rate)
-  elseif dir == 2 then
+  elseif dir == 2 then -- Reverse (Option index 2)
     engine.speed(i, -rate)
-  else
+  else -- Ping-Pong (Option index 3)
+    -- Create and start a new metro for ping-pong
     pingpong_metros[i] = metro.init()
-    pingpong_metros[i].time = 2.0
+    -- Set a default time; actual time might depend on loop points if implemented
+    -- For now, just trigger based on reaching start/end (requires engine feedback or assumptions)
+    -- A simple timer-based ping-pong:
+    local loop_duration = 5.0 -- Guess: Assume a 5 second loop time for reversal? Needs better logic based on sample length/loop points.
+    if rate > 0 then
+      pingpong_metros[i].time = loop_duration / rate -- Adjust time based on rate
+    else
+       pingpong_metros[i].time = 2.0 -- Fallback time if rate is zero
+    end
+
     pingpong_metros[i].event = function()
-      pingpong_sign[i] = -pingpong_sign[i]
-      engine.speed(i, pingpong_sign[i] * rate)
+      pingpong_sign[i] = -pingpong_sign[i] -- Flip direction
+      -- Re-get rate in case it changed while metro was running
+      local current_rate = params:get(rate_param_id)
+      if current_rate ~= nil then -- Check rate still exists
+           engine.speed(i, pingpong_sign[i] * current_rate)
+      end
+      -- Re-calculate metro time if rate changed
+      if current_rate > 0 then
+        pingpong_metros[i].time = loop_duration / current_rate
+      else
+         pingpong_metros[i].time = 2.0 -- Fallback time if rate is zero
+      end
     end
     pingpong_metros[i]:start()
+    -- Start moving forward initially
     engine.speed(i, rate)
   end
 end
+
 
 ----------------------------------------------------------------
 -- 5) PITCH RANDOMIZATION
 ----------------------------------------------------------------
 
 local function random_float(mn, mx)
+  -- Ensure mn <= mx
+  if mn > mx then local temp = mn; mn = mx; mx = temp end
   return mn + math.random()*(mx - mn)
 end
 
 local function get_random_pitch(slot)
   local s = tostring(slot)
-  local root_off = params:get("pitch_root") - 1
-  local sc_idx = params:get("pitch_scale")
-  local base = scales[ scale_options[sc_idx] ]
-  local min_off = tonumber(params:string(s.."pitch_rng_min"))
-  local max_off = tonumber(params:string(s.."pitch_rng_max"))
-  if min_off > max_off then min_off = max_off end
-  local cur_pitch = params:get(s.."pitch")
-  local cur_off = cur_pitch - root_off
-  local allowed = {}
-  for _, iv in ipairs(base) do
-    for _, sh in ipairs({-12, 0, 12}) do
-      local c = iv + sh
-      if c >= min_off and c <= max_off then
-        table.insert(allowed, c)
+  -- Check if necessary params exist
+  if not params:get("pitch_root") or not params:get(s.."pitch_rng_min") or not params:get(s.."pitch") then
+       print("Error: required pitch params not found for slot " .. s)
+       return params:get(s.."pitch") or 0 -- Return current pitch or 0 if params missing
+  end
+
+  local root_note_idx = params:get("pitch_root") -- 1-based index from notes list
+
+  local scale_name_idx = params:get("pitch_scale")
+  local scale_name = scale_options[scale_name_idx]
+  local scale_intervals = scales[scale_name]
+  if not scale_intervals then return params:get(s.."pitch") end -- Safety check, return current pitch
+
+  -- Get min/max range limits (these are option indices, convert to values)
+  local min_option_idx = params:get(s.."pitch_rng_min")
+  local max_option_idx = params:get(s.."pitch_rng_max")
+  -- Need the definition of pitch_vals from setup_params to convert index back to value
+  local pitch_vals_lookup = {}
+  for v = -24, 24 do table.insert(pitch_vals_lookup, v) end
+  local min_semitone_offset = pitch_vals_lookup[min_option_idx]
+  local max_semitone_offset = pitch_vals_lookup[max_option_idx]
+
+  -- Ensure min <= max (should be handled by param actions, but double check)
+  if min_semitone_offset == nil or max_semitone_offset == nil then return params:get(s.."pitch") end -- More safety
+  if min_semitone_offset > max_semitone_offset then min_semitone_offset = max_semitone_offset end
+
+  local current_pitch_st = params:get(s.."pitch")
+
+  local allowed_offsets = {}
+  -- Check scale notes across multiple octaves within the min/max range
+  -- Add root offset here to work with scale intervals directly
+  local root_offset_st = root_note_idx - 1 -- C=0
+  for octave_shift = -24, 24, 12 do
+    for _, interval in ipairs(scale_intervals) do
+      local semitone_offset = interval + octave_shift + root_offset_st
+      if semitone_offset >= min_semitone_offset and semitone_offset <= max_semitone_offset then
+        -- Avoid adding duplicates if range spans octaves
+        local found = false
+        for _, existing in ipairs(allowed_offsets) do
+          if existing == semitone_offset then found = true; break end
+        end
+        if not found then
+             table.insert(allowed_offsets, semitone_offset)
+        end
       end
     end
   end
-  if #allowed > 1 then
-    for i, v in ipairs(allowed) do
-      if v == cur_off then
-        table.remove(allowed, i)
-        break
+
+  -- Remove current pitch from possibilities if more than one option exists
+  if #allowed_offsets > 1 then
+    for i = #allowed_offsets, 1, -1 do -- Iterate backwards when removing
+      if allowed_offsets[i] == current_pitch_st then
+        table.remove(allowed_offsets, i)
+        break -- Assume only one instance of current pitch
       end
     end
   end
-  if #allowed > 0 then
-    local chosen = allowed[math.random(#allowed)]
-    return root_off + chosen
+
+  -- Choose a random offset from the allowed list
+  if #allowed_offsets > 0 then
+    local chosen_st = allowed_offsets[math.random(#allowed_offsets)]
+    return chosen_st
   else
-    return root_off
+    -- If no valid options (e.g., range allows only current pitch), return current pitch
+    return current_pitch_st
   end
 end
+
 
 ----------------------------------------------------------------
 -- 6) PARAMETER DEFINITIONS
@@ -219,159 +362,156 @@ end
 
 local function setup_params()
   params:add_file("browse_root", "sample root dir", _path.audio)
-  params:set_action("browse_root", function(file)
-    if file and file ~= "" then
-      local d = file_dir_name(file)
-      -- Basic validation: check if directory exists
-      if util.file_exists(d) and is_dir(d) then
-         root_dir = d
-         print("browse_root => " .. root_dir)
-      else
-         print("browse_root invalid: " .. d .. ", reverting to default.")
-         root_dir = _path.audio
-         params:set("browse_root", root_dir) -- Update param if corrected
+  -- Corrected browse_root action
+  params:set_action("browse_root", function(selected_path)
+    local new_root = _path.audio -- Default fallback
+    if selected_path and selected_path ~= "" then
+      local potential_root = selected_path
+      -- If selection looks like a file, use its directory
+      if not is_dir(potential_root) and util.file_exists(potential_root) then
+           potential_root = file_dir_name(potential_root)
       end
-    else
-      root_dir = _path.audio
-      print("browse_root => (default) " .. root_dir)
+        -- Check if the potential root is valid
+      if util.file_exists(potential_root) and is_dir(potential_root) then
+           new_root = potential_root
+      else
+           print("browse_root selection invalid: '" .. tostring(selected_path) .."', reverting to default.")
+           -- Force param back to default if selection invalid
+           clock.run(function() clock.sleep(0.1); params:set("browse_root", _path.audio) end)
+      end
+    end
+    -- Update the global root_dir variable
+    root_dir = new_root
+    print("browse_root action set root_dir to: " .. root_dir)
+
+    -- If the browser is currently open, reset its view to the new root
+    if ui_mode == "sample_select" then
+         print("Browser open, resetting current_dir to new root.")
+         current_dir = root_dir
+         item_idx = 1
+         refresh_dir_contents()
+         redraw()
     end
   end)
 
   params:add_separator() -- Separator before groups
 
   -- ======================== SLOT 1 PARAMETERS ========================
-  local slot1_param_count = 21 -- Incremented count
+  local slot1_param_count = 21 -- sample, rate, dir, vol, pan, jitter, size, density, pitch, spread, fade, seek, rseek(o), rseek_min, rseek_max, pitch_chg(o), p_rng_min(o), p_rng_max(o), filt_chg(o), f_cut, f_q
   params:add_group("slot1", "Slot 1 Settings", slot1_param_count)
   do -- Use a block to scope local i = 1
     local i = 1
     local sid = i.."" -- String version of slot index for IDs
 
-    -- Unique ID: sid.."sample", Label: "sample"
     params:add_file(sid.."sample", "sample")
     params:set_action(sid.."sample", function(f) engine.read(i, f) end)
 
-    -- Unique ID: sid.."playhead_rate", Label: "playhead rate"
     params:add_control(sid.."playhead_rate", "playhead rate",
       controlspec.new(0, 4, "lin", 0.01, 1.0, "", 0.01/4))
     params:set_action(sid.."playhead_rate", function() update_playhead(i) end)
 
-    -- Unique ID: sid.."playhead_direction", Label: "direction"
     params:add_option(sid.."playhead_direction", "direction", {">>", "<<", "<->"}, 1)
     params:set_action(sid.."playhead_direction", function() update_playhead(i) end)
 
-    -- Unique ID: sid.."volume", Label: "volume"
     params:add_taper(sid.."volume", "volume", -60, 20, 0, 0, "dB")
     params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
+
     params:add_control(sid.."pan", "pan", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, "", 0.01))
     params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
 
-    -- Unique ID: sid.."jitter", Label: "jitter"
     params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
     params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
 
-    -- Unique ID: sid.."size", Label: "size"
     params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
     params:set_action(sid.."size", function(v) engine.size(i, v/1000) end)
 
-    -- Unique ID: sid.."density", Label: "density"
     params:add_taper(sid.."density", "density", 0, 512, 20, 6, "hz")
     params:set_action(sid.."density", function(v) engine.density(i, v) end)
 
-    -- Unique ID: sid.."pitch", Label: "pitch"
     params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
     params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
-    -- Unique ID: sid.."spread", Label: "spread"
+
     params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
     params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
 
-    -- Unique ID: sid.."fade", Label: "fade"
     params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
     params:set_action(sid.."fade", function(v) engine.envscale(i, v/1000) end)
 
-    -- Unique ID: sid.."seek", Label: "seek"
     params:add_control(sid.."seek", "seek",
       controlspec.new(0, 100, "lin", 0.1, 0, "%", 0.1/100)) -- Default 0 for slot 1
     params:set_action(sid.."seek", function(v) engine.seek(i, v/100) end)
 
-    -- Unique ID: sid.."random_seek", Label: "random seek"
     params:add_option(sid.."random_seek", "random seek", {"off", "on"}, 1)
-
-    -- Unique ID: sid.."random_seek_freq_min", Label: "rseek freq min"
     params:add_control(sid.."random_seek_freq_min", "rseek freq min",
       controlspec.new(100, 30000, "lin", 100, 500, "ms"))
-    params:set_action(sid.."random_seek_freq_min", function(val)
-      local mx = params:get(sid.."random_seek_freq_max")
-      if val > mx then params:set(sid.."random_seek_freq_min", mx) end
-    end)
-
-    -- Unique ID: sid.."random_seek_freq_max", Label: "rseek freq max"
     params:add_control(sid.."random_seek_freq_max", "rseek freq max",
       controlspec.new(100, 30000, "lin", 100, 2000, "ms"))
+    -- Actions to ensure min <= max
+    params:set_action(sid.."random_seek_freq_min", function(val)
+      local mx = params:get(sid.."random_seek_freq_max")
+      if mx ~= nil and val > mx then params:set(sid.."random_seek_freq_min", mx) end
+    end)
     params:set_action(sid.."random_seek_freq_max", function(val)
       local mn = params:get(sid.."random_seek_freq_min")
-      if val < mn then params:set(sid.."random_seek_freq_max", mn) end
+      if mn ~= nil and val < mn then params:set(sid.."random_seek_freq_max", mn) end
     end)
-
-    -- Action for random_seek toggle (refers to other params within the same slot)
+    -- Action for random_seek toggle
     params:set_action(sid.."random_seek", function(val)
-      if val == 2 then
+      if val == 2 then -- "on"
         if not random_seek_metros[i] then
           random_seek_metros[i] = metro.init()
           random_seek_metros[i].event = function()
-            params:set(sid.."seek", math.random() * 100)
+            -- Check param exists before setting (safety)
+            if params:get(sid.."seek") ~= nil then
+              params:set(sid.."seek", math.random() * 100)
+            end
             local tmin = params:get(sid.."random_seek_freq_min")
             local tmax = params:get(sid.."random_seek_freq_max")
-            local nxt = math.random(tmin, tmax)
-            random_seek_metros[i].time = nxt / 1000
+            if tmin ~= nil and tmax ~= nil then
+                 local nxt = math.random(tmin, tmax)
+                 random_seek_metros[i].time = nxt / 1000
+            end
           end
         end
         local tmin_init = params:get(sid.."random_seek_freq_min")
         local tmax_init = params:get(sid.."random_seek_freq_max")
-        random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000
-        random_seek_metros[i]:start()
-      else
-        if random_seek_metros[i] then random_seek_metros[i]:stop() end
+        if tmin_init ~= nil and tmax_init ~= nil then
+             random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000
+             random_seek_metros[i]:start()
+        end
+      else -- "off"
+        if random_seek_metros[i] then
+          random_seek_metros[i]:stop()
+        end
       end
     end)
 
-    -- Unique ID: sid.."pitch_change", Label: "pitch change?"
     params:add_option(sid.."pitch_change", "pitch change?", {"no", "yes"}, 2)
-
-    local pitch_vals = {}
-    for v = -24, 24 do table.insert(pitch_vals, v) end
-    local pitch_strs = {}
-    for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
-
-    -- Unique ID: sid.."pitch_rng_min", Label: "pitch rng min"
-    params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25) -- 0 st
+    local pitch_vals = {} for v = -24, 24 do table.insert(pitch_vals, v) end
+    local pitch_strs = {} for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
+    params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25) -- 0 st (index 25)
+    params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25) -- 0 st (index 25)
+    -- Actions to ensure min <= max for range options
     params:set_action(sid.."pitch_rng_min", function(idx)
-      local mn_idx = idx -- Use the new index being set
+      local mn_idx = idx
       local mx_idx = params:get(sid.."pitch_rng_max")
-      if mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end
+      if mx_idx ~= nil and mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end
     end)
-
-    -- Unique ID: sid.."pitch_rng_max", Label: "pitch rng max"
-    params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25) -- 0 st
     params:set_action(sid.."pitch_rng_max", function(idx)
-       local mn_idx = params:get(sid.."pitch_rng_min")
-       local mx_idx = idx -- Use the new index being set
-       if mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end
+        local mn_idx = params:get(sid.."pitch_rng_min")
+        local mx_idx = idx
+        if mn_idx ~= nil and mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end
     end)
 
-    -- Unique ID: sid.."filter_change", Label: "random filter?"
     params:add_option(sid.."filter_change", "random filter?", {"no", "yes"}, 1)
-
-    -- Unique ID: sid.."filter_cutoff", Label: "filter cutoff"
     params:add_taper(sid.."filter_cutoff", "filter cutoff", 20, 20000, 8000, 0, "Hz")
     params:set_action(sid.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
-
-    -- Unique ID: sid.."filter_q", Label: "filter Q"
     params:add_taper(sid.."filter_q", "filter Q", 0.1, 4.0, 0.5, 0, "")
     params:set_action(sid.."filter_q", function(v) engine.filterRQ(i, v) end)
   end -- End of Slot 1 block
 
   -- ======================== SLOT 2 PARAMETERS ========================
-  local slot2_param_count = 21 -- Incremented count
+  local slot2_param_count = 21
   params:add_group("slot2", "Slot 2 Settings", slot2_param_count)
   do -- Use a block to scope local i = 2
     local i = 2
@@ -386,6 +526,7 @@ local function setup_params()
     params:add_taper(sid.."volume", "volume", -60, 20, -60, 0, "dB") -- Default -60
     params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
     params:add_control(sid.."pan", "pan", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, "", 0.01))
+    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
     params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
     params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
     params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
@@ -394,7 +535,6 @@ local function setup_params()
     params:set_action(sid.."density", function(v) engine.density(i, v) end)
     params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
     params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
-    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
     params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
     params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
     params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
@@ -404,16 +544,16 @@ local function setup_params()
     params:add_option(sid.."random_seek", "random seek", {"off", "on"}, 1)
     params:add_control(sid.."random_seek_freq_min", "rseek freq min", controlspec.new(100, 30000, "lin", 100, 500, "ms"))
     params:add_control(sid.."random_seek_freq_max", "rseek freq max", controlspec.new(100, 30000, "lin", 100, 2000, "ms"))
-    params:set_action(sid.."random_seek_freq_min", function(val) local mx = params:get(sid.."random_seek_freq_max"); if val > mx then params:set(sid.."random_seek_freq_min", mx) end end)
-    params:set_action(sid.."random_seek_freq_max", function(val) local mn = params:get(sid.."random_seek_freq_min"); if val < mn then params:set(sid.."random_seek_freq_max", mn) end end)
-    params:set_action(sid.."random_seek", function(val) if val == 2 then if not random_seek_metros[i] then random_seek_metros[i] = metro.init(); random_seek_metros[i].event = function() params:set(sid.."seek", math.random() * 100); local tmin = params:get(sid.."random_seek_freq_min"); local tmax = params:get(sid.."random_seek_freq_max"); local nxt = math.random(tmin, tmax); random_seek_metros[i].time = nxt / 1000; end end; local tmin_init = params:get(sid.."random_seek_freq_min"); local tmax_init = params:get(sid.."random_seek_freq_max"); random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000; random_seek_metros[i]:start(); else if random_seek_metros[i] then random_seek_metros[i]:stop() end end end)
+    params:set_action(sid.."random_seek_freq_min", function(val) local mx = params:get(sid.."random_seek_freq_max"); if mx ~= nil and val > mx then params:set(sid.."random_seek_freq_min", mx) end end)
+    params:set_action(sid.."random_seek_freq_max", function(val) local mn = params:get(sid.."random_seek_freq_min"); if mn ~= nil and val < mn then params:set(sid.."random_seek_freq_max", mn) end end)
+    params:set_action(sid.."random_seek", function(val) if val == 2 then if not random_seek_metros[i] then random_seek_metros[i] = metro.init(); random_seek_metros[i].event = function() if params:get(sid.."seek") ~= nil then params:set(sid.."seek", math.random() * 100) end; local tmin = params:get(sid.."random_seek_freq_min"); local tmax = params:get(sid.."random_seek_freq_max"); if tmin ~= nil and tmax ~= nil then local nxt = math.random(tmin, tmax); random_seek_metros[i].time = nxt / 1000; end end end; local tmin_init = params:get(sid.."random_seek_freq_min"); local tmax_init = params:get(sid.."random_seek_freq_max"); if tmin_init ~= nil and tmax_init ~= nil then random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000; random_seek_metros[i]:start() end; else if random_seek_metros[i] then random_seek_metros[i]:stop() end end end)
     params:add_option(sid.."pitch_change", "pitch change?", {"no", "yes"}, 2)
     local pitch_vals = {} for v = -24, 24 do table.insert(pitch_vals, v) end
     local pitch_strs = {} for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
     params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25)
     params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25)
-    params:set_action(sid.."pitch_rng_min", function(idx) local mn_idx = idx; local mx_idx = params:get(sid.."pitch_rng_max"); if mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end end)
-    params:set_action(sid.."pitch_rng_max", function(idx) local mn_idx = params:get(sid.."pitch_rng_min"); local mx_idx = idx; if mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end end)
+    params:set_action(sid.."pitch_rng_min", function(idx) local mn_idx = idx; local mx_idx = params:get(sid.."pitch_rng_max"); if mx_idx ~= nil and mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end end)
+    params:set_action(sid.."pitch_rng_max", function(idx) local mn_idx = params:get(sid.."pitch_rng_min"); local mx_idx = idx; if mn_idx ~= nil and mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end end)
     params:add_option(sid.."filter_change", "random filter?", {"no", "yes"}, 1)
     params:add_taper(sid.."filter_cutoff", "filter cutoff", 20, 20000, 8000, 0, "Hz")
     params:set_action(sid.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
@@ -423,7 +563,7 @@ local function setup_params()
 
 
   -- ======================== SLOT 3 PARAMETERS ========================
-  local slot3_param_count = 21 -- Incremented count
+  local slot3_param_count = 21
   params:add_group("slot3", "Slot 3 Settings", slot3_param_count)
   do -- Use a block to scope local i = 3
     local i = 3
@@ -438,6 +578,7 @@ local function setup_params()
     params:add_taper(sid.."volume", "volume", -60, 20, -60, 0, "dB") -- Default -60
     params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
     params:add_control(sid.."pan", "pan", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, "", 0.01))
+    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
     params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
     params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
     params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
@@ -446,7 +587,6 @@ local function setup_params()
     params:set_action(sid.."density", function(v) engine.density(i, v) end)
     params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
     params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
-    params:set_action(sid.."pan", function(v) engine.pan(i, v) end)
     params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
     params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
     params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
@@ -456,16 +596,16 @@ local function setup_params()
     params:add_option(sid.."random_seek", "random seek", {"off", "on"}, 1)
     params:add_control(sid.."random_seek_freq_min", "rseek freq min", controlspec.new(100, 30000, "lin", 100, 500, "ms"))
     params:add_control(sid.."random_seek_freq_max", "rseek freq max", controlspec.new(100, 30000, "lin", 100, 2000, "ms"))
-    params:set_action(sid.."random_seek_freq_min", function(val) local mx = params:get(sid.."random_seek_freq_max"); if val > mx then params:set(sid.."random_seek_freq_min", mx) end end)
-    params:set_action(sid.."random_seek_freq_max", function(val) local mn = params:get(sid.."random_seek_freq_min"); if val < mn then params:set(sid.."random_seek_freq_max", mn) end end)
-    params:set_action(sid.."random_seek", function(val) if val == 2 then if not random_seek_metros[i] then random_seek_metros[i] = metro.init(); random_seek_metros[i].event = function() params:set(sid.."seek", math.random() * 100); local tmin = params:get(sid.."random_seek_freq_min"); local tmax = params:get(sid.."random_seek_freq_max"); local nxt = math.random(tmin, tmax); random_seek_metros[i].time = nxt / 1000; end end; local tmin_init = params:get(sid.."random_seek_freq_min"); local tmax_init = params:get(sid.."random_seek_freq_max"); random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000; random_seek_metros[i]:start(); else if random_seek_metros[i] then random_seek_metros[i]:stop() end end end)
+    params:set_action(sid.."random_seek_freq_min", function(val) local mx = params:get(sid.."random_seek_freq_max"); if mx ~= nil and val > mx then params:set(sid.."random_seek_freq_min", mx) end end)
+    params:set_action(sid.."random_seek_freq_max", function(val) local mn = params:get(sid.."random_seek_freq_min"); if mn ~= nil and val < mn then params:set(sid.."random_seek_freq_max", mn) end end)
+    params:set_action(sid.."random_seek", function(val) if val == 2 then if not random_seek_metros[i] then random_seek_metros[i] = metro.init(); random_seek_metros[i].event = function() if params:get(sid.."seek") ~= nil then params:set(sid.."seek", math.random() * 100) end; local tmin = params:get(sid.."random_seek_freq_min"); local tmax = params:get(sid.."random_seek_freq_max"); if tmin ~= nil and tmax ~= nil then local nxt = math.random(tmin, tmax); random_seek_metros[i].time = nxt / 1000; end end end; local tmin_init = params:get(sid.."random_seek_freq_min"); local tmax_init = params:get(sid.."random_seek_freq_max"); if tmin_init ~= nil and tmax_init ~= nil then random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000; random_seek_metros[i]:start() end; else if random_seek_metros[i] then random_seek_metros[i]:stop() end end end)
     params:add_option(sid.."pitch_change", "pitch change?", {"no", "yes"}, 2)
     local pitch_vals = {} for v = -24, 24 do table.insert(pitch_vals, v) end
     local pitch_strs = {} for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
     params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25)
     params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25)
-    params:set_action(sid.."pitch_rng_min", function(idx) local mn_idx = idx; local mx_idx = params:get(sid.."pitch_rng_max"); if mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end end)
-    params:set_action(sid.."pitch_rng_max", function(idx) local mn_idx = params:get(sid.."pitch_rng_min"); local mx_idx = idx; if mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end end)
+    params:set_action(sid.."pitch_rng_min", function(idx) local mn_idx = idx; local mx_idx = params:get(sid.."pitch_rng_max"); if mx_idx ~= nil and mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end end)
+    params:set_action(sid.."pitch_rng_max", function(idx) local mn_idx = params:get(sid.."pitch_rng_min"); local mx_idx = idx; if mn_idx ~= nil and mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end end)
     params:add_option(sid.."filter_change", "random filter?", {"no", "yes"}, 1)
     params:add_taper(sid.."filter_cutoff", "filter cutoff", 20, 20000, 8000, 0, "Hz")
     params:set_action(sid.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
@@ -535,53 +675,105 @@ local function setup_params()
   params:add_taper("min_filter_q", "filter Q (min)", 0.1, 4.0, 0.25, 0, "")
   params:add_taper("max_filter_q", "filter Q (max)", 0.1, 4.0, 1.2, 0, "")
 
-  -- Note: pitch_1..5 params seem unused by randomize() function, perhaps legacy? Kept for now.
+  -- Legacy pitch params (unused by randomize function)
   params:add_taper("pitch_1", "pitch (1)", -48, 48, -12, 0, "st")
   params:add_taper("pitch_2", "pitch (2)", -48, 48, -5, 0, "st")
   params:add_taper("pitch_3", "pitch (3)", -48, 48, 0, 0, "st")
   params:add_taper("pitch_4", "pitch (4)", -48, 48, 7, 0, "st")
   params:add_taper("pitch_5", "pitch (5)", -48, 48, 12, 0, "st")
 
-  params:bang() -- Trigger initial actions for all params
+
+  -- ======================== LFO PARAMETERS ========================
+  params:add_separator("LFOs")
+
+  for lfo_idx = 1, 4 do
+    local lfo_id_prefix = "lfo" .. lfo_idx .. "_" -- e.g., "lfo1_"
+    local lfo_group_id = "lfo" .. lfo_idx         -- e.g., "lfo1" (used for group id)
+    local lfo_group_name = "LFO " .. lfo_idx       -- e.g., "LFO 1" (display name)
+    -- Count parameters per LFO: target_slot, target_param, rate, amount, shape
+    local lfo_param_count = 5
+
+    params:add_group(lfo_group_id, lfo_group_name, lfo_param_count)
+
+    -- Target Slot (Which voice: 1, 2, or 3)
+    params:add_option(lfo_id_prefix .. "target_slot", "target slot", {"1", "2", "3"}, 1)
+    -- No action needed here, LFO update function reads this
+
+    -- Target Parameter (Which param within the slot)
+    params:add_option(lfo_id_prefix .. "target_param", "target param", lfo_target_param_names, 1) -- Default "volume"
+    -- No action needed here
+
+    -- LFO Rate
+    params:add_control(lfo_id_prefix .. "rate", "rate", controlspec.new(0.01, 20, "exp", 0.01, 1.0, "Hz"))
+    -- No action needed here
+
+    -- LFO Amount/Depth (0 = off, 1 = full range modulation)
+    params:add_control(lfo_id_prefix .. "amount", "amount", controlspec.new(0.0, 1.0, "lin", 0.01, 0.0, "")) -- Default 0 (LFO off)
+    -- No action needed here
+
+    -- LFO Shape
+    params:add_option(lfo_id_prefix .. "shape", "shape", lfo_shape_names, 1) -- Default 'sine'
+    -- No action needed here
+
+  end -- End LFO loop
+
+  -- ======================== END LFO PARAMETERS ========================
+
+
+  params:bang() -- Trigger initial actions for all params based on loaded/default values
 end
 
--- (Rest of the script remains the same)
+
 ----------------------------------------------------------------
 -- 7) RANDOMIZE LOGIC
 ----------------------------------------------------------------
 
 local function randomize(slot)
-  local morph_ms = morph_time_options[params:get("morph_time")]
-  local morph_duration = morph_ms / 1000
+  -- Check if necessary params exist before proceeding
+  if not params:get("morph_time") or
+     not params:get("min_jitter") or not params:get("max_jitter") or
+     not params:get(slot.."jitter") or not params:get(slot.."seek") or not params:get(slot.."pan") then
+       print("Error: Cannot randomize slot " .. slot .. " - required params missing.")
+       return
+  end
 
+  local morph_time_idx = params:get("morph_time")
+  local morph_ms = morph_time_options[morph_time_idx] or 0 -- Default 0 if not found
+  local morph_duration = morph_ms / 1000
+  local s = tostring(slot) -- Param ID prefix
+
+  -- Randomize grain parameters
   local new_jitter = random_float(params:get("min_jitter"), params:get("max_jitter"))
   local new_size = random_float(params:get("min_size"), params:get("max_size"))
   local new_density = random_float(params:get("min_density"), params:get("max_density"))
   local new_spread = random_float(params:get("min_spread"), params:get("max_spread"))
 
-  if params:get(slot.."pitch_change") == 2 then
+  smooth_transition(s.."jitter", new_jitter, morph_duration)
+  smooth_transition(s.."size", new_size, morph_duration)
+  smooth_transition(s.."density", new_density, morph_duration)
+  smooth_transition(s.."spread", new_spread, morph_duration)
+
+  -- Randomize pitch if enabled
+  if params:get(s.."pitch_change") == 2 then -- "yes"
     local new_pitch = get_random_pitch(slot)
-    -- Use smooth transition for pitch if morph duration > 0
-    if morph_duration > 0 then
-      smooth_transition(slot.."pitch", new_pitch, morph_duration)
-    else
-      params:set(slot.."pitch", new_pitch)
-    end
+    smooth_transition(s.."pitch", new_pitch, morph_duration)
   end
 
-  if params:get(slot.."filter_change") == 2 then
+  -- Randomize filter if enabled
+  if params:get(s.."filter_change") == 2 then -- "yes"
     local new_cutoff = random_float(params:get("min_filter_cutoff"), params:get("max_filter_cutoff"))
     local new_q = random_float(params:get("min_filter_q"), params:get("max_filter_q"))
-    smooth_transition(slot.."filter_cutoff", new_cutoff, morph_duration)
-    smooth_transition(slot.."filter_q", new_q, morph_duration)
+    smooth_transition(s.."filter_cutoff", new_cutoff, morph_duration)
+    smooth_transition(s.."filter_q", new_q, morph_duration)
   end
 
-  local new_seek = math.random(0, 100)
-  smooth_transition(slot.."seek", new_seek, morph_duration)
-  smooth_transition(slot.."jitter", new_jitter, morph_duration)
-  smooth_transition(slot.."size", new_size, morph_duration)
-  smooth_transition(slot.."density", new_density, morph_duration)
-  smooth_transition(slot.."spread", new_spread, morph_duration)
+  -- Randomize seek position
+  local new_seek = math.random() * 100 -- Random value between 0 and 100
+  smooth_transition(s.."seek", new_seek, morph_duration)
+
+  -- Randomize pan position
+  local new_pan = random_float(-1.0, 1.0)
+  smooth_transition(s.."pan", new_pan, morph_duration)
 end
 
 ----------------------------------------------------------------
@@ -589,28 +781,30 @@ end
 ----------------------------------------------------------------
 
 local function setup_engine()
-  -- Set initial values (these will be overridden by params:bang() if saved)
-  engine.seek(1, 0)
+  -- This function now primarily ensures gates are open and
+  -- relies on params:bang() in setup_params() to set initial engine values
+  -- based on saved PSET or defaults.
+
   engine.gate(1, 1)
-
-  engine.seek(2, 0)
   engine.gate(2, 1)
-
-  engine.seek(3, 1)
   engine.gate(3, 1)
 
-  -- Ensure params are loaded and actions triggered *before* randomizing
-  -- params:bang() is now called at the end of setup_params()
-
-  -- Set initial playhead speeds based on loaded/default param values
-  for i = 1, 3 do
-    update_playhead(i)
-  end
-
-  -- Optional: Apply initial randomization if desired, or rely on saved state
-  -- randomize(1)
-  -- randomize(2)
-  -- randomize(3)
+  -- Set initial playhead speeds based on potentially loaded param values
+  -- update_playhead is called by the param action triggered by params:bang()
+  -- Also ensure random seek metros are correctly started if loaded from PSET
+  clock.run(function()
+      clock.sleep(0.1) -- Small delay allows params system to settle
+      for i = 1, 3 do
+        -- Call update_playhead explicitly to be sure it runs after init
+        update_playhead(i)
+        -- Check random seek status
+        if params:get(i.."random_seek") == 2 then -- If "on"
+            -- Trigger the action again to start the metro if needed
+            params:set(i.."random_seek", 1) -- Temporarily set to off
+            params:set(i.."random_seek", 2) -- Set back to on to trigger action
+        end
+      end
+  end)
 end
 
 ----------------------------------------------------------------
@@ -619,15 +813,29 @@ end
 
 local function refresh_dir_contents()
   item_list = list_dir_contents(current_dir)
-  item_idx = util.clamp(item_idx, 1, #item_list)
+  -- Clamp index, considering potential empty list
+  item_idx = util.clamp(item_idx, 1, math.max(1, #item_list))
 end
 
+-- Corrected open_sample_select
 local function open_sample_select()
+  print("Opening sample select...")
+  -- Ensure root_dir is valid before using it (safety check)
+  if not root_dir or not util.file_exists(root_dir) or not is_dir(root_dir) then
+       print("Warning: Invalid root_dir ('"..tostring(root_dir).."') detected. Reverting to audio default.")
+       root_dir = _path.audio
+       params:set("browse_root", root_dir) -- Correct param too
+  end
+
   ui_mode = "sample_select"
+  -- Always start Browse from the validated root directory
   current_dir = root_dir
+  print("Sample select starting at: " .. current_dir)
+  -- Reset view state
   item_idx = 1
   slot_idx = 1
-  refresh_dir_contents() -- Refresh contents immediately
+  refresh_dir_contents() -- Refresh contents for the root directory
+  redraw() -- Update display immediately
 end
 
 local function open_item()
@@ -635,122 +843,286 @@ local function open_item()
   local it = item_list[item_idx]
   if it.type == "up" or it.type == "dir" then
     current_dir = it.path
+    item_idx = 1 -- Reset item index when changing directory
     refresh_dir_contents()
+    redraw()
   elseif it.type == "file" then
     -- If user presses K2 on a file, load it into the current slot
-     print("confirm_sample_select (K2): reading " .. it.path .. " into slot " .. slot_idx)
+     print("Load sample (K2): reading " .. it.path .. " into slot " .. slot_idx)
      engine.read(slot_idx, it.path)
-     params:set(slot_idx.."sample", it.path)
+     params:set(slot_idx.."sample", it.path) -- Update the parameter
      ui_mode = "main" -- Exit sample select after loading
+     redraw() -- Update screen immediately
   end
 end
 
 local function confirm_sample_select()
   if #item_list < 1 or item_idx < 1 or item_idx > #item_list then
-    ui_mode = "main"
+    ui_mode = "main" -- Exit if list is empty or index invalid
+    redraw()
     return
   end
   local it = item_list[item_idx]
-  print("confirm_sample_select: item type = " .. tostring(it.type))
+
   if it.type == "file" then
-    print("confirm_sample_select (K3): reading " .. it.path .. " into slot " .. slot_idx)
+    print("Load sample (K3): reading " .. it.path .. " into slot " .. slot_idx)
     engine.read(slot_idx, it.path)
-    params:set(slot_idx.."sample", it.path)
+    params:set(slot_idx.."sample", it.path) -- Update the parameter
+    ui_mode = "main" -- Exit sample select after loading
+    redraw()
   elseif it.type == "dir" or it.type == "up" then
-     -- If K3 pressed on a directory, open it (same as K2)
-     current_dir = it.path
-     refresh_dir_contents()
-     return -- Stay in sample select mode
+      -- If K3 pressed on a directory or '..', open it (same as K2)
+      current_dir = it.path
+      item_idx = 1 -- Reset item index
+      refresh_dir_contents()
+      redraw() -- Update browser view, stay in sample select mode
   else
-    print("confirm_sample_select: selection is not a file or directory.")
+    -- If "none" type item selected, just exit
+    -- print("confirm_sample_select: selection is not a file or directory.")
+    ui_mode = "main" -- Exit if selection invalid
+    redraw()
   end
-  ui_mode = "main" -- Exit sample select after loading or if selection invalid
 end
 
 ----------------------------------------------------------------
 -- 10) KEY / ENC HANDLING
 ----------------------------------------------------------------
 
+-- Corrected key function
 function key(n, z)
-  if ui_mode == "sample_select" then
-    if n == 2 and z == 1 then
-      open_item()  -- K2 opens folder/up OR loads selected file
-    elseif n == 3 and z == 1 then
-      confirm_sample_select()  -- K3 confirms file load OR opens selected folder
-    end
-    return
-  end
-
-  if n == 1 then
-    if z == 1 then
-      key1_hold = true
-      clock.run(function()
-        clock.sleep(1)
-        if key1_hold then randomize(3) end
-      end)
-    else key1_hold = false end
-
-  elseif n == 2 then
-    if z == 1 then
-      key2_hold = true
-      clock.run(function()
-        clock.sleep(1)
-        if key2_hold == true then -- Check hold state hasn't changed
-          open_sample_select()
-          key2_hold = "sample_select" -- Update state to indicate mode change
-          redraw() -- Update screen immediately
+    if ui_mode == "sample_select" then
+      if z == 1 then -- Key down only
+        if n == 1 then -- K1 exits sample select mode
+          ui_mode = "main"
+          redraw()
+        elseif n == 2 then
+          open_item()  -- K2 opens folder/up OR loads selected file
+        elseif n == 3 then
+          confirm_sample_select()  -- K3 confirms file load OR opens selected folder
         end
-      end)
-    else
-      if key2_hold == true then -- Short press detected
-        randomize(1)
       end
-      key2_hold = false -- Reset hold state regardless
+      return -- Prevent main mode key handling
     end
 
-  elseif n == 3 then
-    if z == 1 then
-      key3_hold = true
-      clock.run(function()
-        clock.sleep(1)
-        -- No long press action defined for K3
-        -- if key3_hold then
-        --   -- Long press action here
-        -- end
-      end)
-    else
-      if key3_hold then -- Short press detected
+    -- Main Mode Key Handling
+    if n == 1 then
+      if z == 1 then -- K1 Press: Randomize Slot 3
+        print("K1 press: Randomize Slot 3")
+        randomize(3)
+      end
+    elseif n == 2 then
+      if z == 1 then -- K2 Press: Start timer for long press
+        key2_hold = true -- Mark as pressed
+        clock.run(function()
+          clock.sleep(0.6) -- Hold duration threshold
+          if key2_hold then -- Still held? It's a long press.
+            print("K2 long press: Open Sample Select")
+            key2_hold = "long_executed" -- Mark long press action as done *before* opening selector
+            open_sample_select() -- This changes ui_mode and redraws
+          end
+        end)
+      else -- K2 Release (z == 0)
+        if key2_hold == true then -- Was pressed but long press didn't execute? Short press.
+          print("K2 short press: Randomize Slot 1")
+          randomize(1)
+        end
+        key2_hold = false -- Reset state on release
+      end
+    elseif n == 3 then
+      if z == 1 then -- K3 Press: Randomize Slot 2
+        print("K3 press: Randomize Slot 2")
         randomize(2)
       end
-      key3_hold = false -- Reset hold state
     end
   end
-end
 
 function enc(n, d)
   if ui_mode == "sample_select" then
-    if n == 2 then
-      item_idx = util.clamp(item_idx + d, 1, #item_list)
-    elseif n == 3 then
+    if n == 2 then -- E2 scrolls file/dir list
+      item_idx = util.clamp(item_idx + d, 1, math.max(1, #item_list))
+    elseif n == 3 then -- E3 selects target slot
       slot_idx = util.clamp(slot_idx + d, 1, 3)
     end
+    redraw() -- Update browser display
   else
-    -- Modified encoder behavior:
-    -- E1 controls volume for slot 3,
-    -- E2 controls volume for slot 1,
-    -- E3 controls volume for slot 2.
-    if n == 1 then
-      params:delta("3volume", d)
-    elseif n == 2 then
-      params:delta("1volume", d)
-    elseif n == 3 then
-      params:delta("2volume", d)
+    -- Main Mode Encoder Handling: Volume control
+    -- E1 -> Slot 3 Volume
+    -- E2 -> Slot 1 Volume
+    -- E3 -> Slot 2 Volume
+    local target_param_id = ""
+    if n == 1 then target_param_id = "3volume"
+    elseif n == 2 then target_param_id = "1volume"
+    elseif n == 3 then target_param_id = "2volume"
     end
+    if target_param_id ~= "" then
+      -- Check param exists before delta
+      if params:get(target_param_id) ~= nil then
+           params:delta(target_param_id, d)
+      end
+    end
+    -- Redraw is handled by the UI metro
   end
 end
 
 ----------------------------------------------------------------
--- 11) REDRAW
+-- 11) LFO LOGIC
+----------------------------------------------------------------
+
+local function update_lfos()
+  for lfo_idx = 1, 4 do
+    local lfo_id_prefix = "lfo" .. lfo_idx .. "_"
+    local amount = params:get(lfo_id_prefix .. "amount")
+
+    -- Skip if LFO amount is negligible
+    if amount < 0.001 then
+       lfo_values[lfo_idx] = 0 -- Ensure value is reset if turned off
+       goto continue_lfo_loop -- Skip to the next LFO
+    end
+
+    -- Get LFO parameters
+    local target_slot_idx = params:get(lfo_id_prefix .. "target_slot") -- Option index (1, 2, 3)
+    local target_slot = target_slot_idx -- Already the correct slot number (1, 2, or 3)
+
+    local target_param_idx = params:get(lfo_id_prefix .. "target_param") -- Option index
+    local target_param_name = lfo_target_param_names[target_param_idx]
+
+    local rate = params:get(lfo_id_prefix .. "rate")
+    local shape_idx = params:get(lfo_id_prefix .. "shape")
+    local shape_name = lfo_shape_names[shape_idx]
+
+    -- Update phase
+    local current_phase = lfo_phases[lfo_idx][1]
+    local new_phase = (current_phase + rate * LFO_METRO_RATE) % 1.0
+    lfo_phases[lfo_idx][1] = new_phase
+
+    -- Calculate LFO wave value (-1 to 1)
+    local lfo_wave = 0
+    if shape_name == "sine" then
+      lfo_wave = math.sin(new_phase * 2 * math.pi)
+    elseif shape_name == "tri" then
+      lfo_wave = tri_wave(new_phase)
+    elseif shape_name == "saw" then
+      lfo_wave = (new_phase * 2.0) - 1.0 -- Ramp up from -1 to 1
+    elseif shape_name == "sqr" then
+      lfo_wave = (new_phase < 0.5) and 1.0 or -1.0
+    elseif shape_name == "random" then
+      -- Simple continuous random
+      lfo_wave = (math.random() * 2.0) - 1.0
+      -- Could implement stepped random here if desired
+      -- Example: update only when phase crosses 0
+      -- if new_phase < current_phase then -- phase wrapped
+      --   lfo_values[lfo_idx] = (math.random() * 2.0) - 1.0
+      -- end
+      -- lfo_wave = lfo_values[lfo_idx] -- Use stored value
+    end
+    lfo_values[lfo_idx] = lfo_wave -- Store current raw value if needed elsewhere
+
+    -- Apply modulation
+    local full_param_id = target_slot .. target_param_name
+    local base_val = params:get(full_param_id)
+
+    if base_val ~= nil then
+       local modulated_val = base_val -- Start with base
+       local final_engine_val -- Value in the format engine expects
+
+       -- Apply modulation based on parameter type
+       if target_param_name == "volume" then -- dB taper, range -60 to 20
+         local range = 80 -- (20 - (-60))
+         local offset_db = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_db, -60, 20)
+         final_engine_val = util.dbamp(modulated_val) -- Convert to amplitude
+         engine.volume(target_slot, final_engine_val)
+
+       elseif target_param_name == "pan" then -- Linear, range -1 to 1
+         local range = 2 -- (1 - (-1))
+         local offset = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset, -1.0, 1.0)
+         final_engine_val = modulated_val
+         engine.pan(target_slot, final_engine_val)
+
+       elseif target_param_name == "jitter" then -- ms taper, 0 to 2000
+         local range = 2000
+         local offset_ms = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_ms, 0, 2000)
+         final_engine_val = modulated_val / 1000.0 -- Convert to seconds
+         engine.jitter(target_slot, final_engine_val)
+
+       elseif target_param_name == "size" then -- ms taper, 1 to 500
+         local range = 499
+         local offset_ms = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_ms, 1, 500)
+         final_engine_val = modulated_val / 1000.0 -- Convert to seconds
+         engine.size(target_slot, final_engine_val)
+
+       elseif target_param_name == "density" then -- hz taper, 0 to 512
+         local range = 512
+         local offset_hz = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_hz, 0, 512)
+         final_engine_val = modulated_val
+         engine.density(target_slot, final_engine_val)
+
+       elseif target_param_name == "pitch" then -- st taper, -48 to 48
+         local range = 96 -- (48 - (-48))
+         local offset_st = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_st, -48, 48)
+         final_engine_val = math.pow(2, modulated_val / 12.0) -- Convert to pitch ratio
+         engine.pitch(target_slot, final_engine_val)
+
+       elseif target_param_name == "spread" then -- % taper, 0 to 100
+         local range = 100
+         local offset_pct = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_pct, 0, 100)
+         final_engine_val = modulated_val / 100.0 -- Convert to 0-1
+         engine.spread(target_slot, final_engine_val)
+
+       elseif target_param_name == "fade" then -- ms taper, 1 to 9000
+         local range = 8999
+         local offset_ms = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_ms, 1, 9000)
+         final_engine_val = modulated_val / 1000.0 -- Convert to seconds
+         engine.envscale(target_slot, final_engine_val)
+
+       elseif target_param_name == "seek" then -- % linear, 0 to 100
+         local range = 100
+         local offset_pct = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_pct, 0, 100)
+         final_engine_val = modulated_val / 100.0 -- Convert to 0-1
+         engine.seek(target_slot, final_engine_val)
+
+       elseif target_param_name == "filter_cutoff" then -- Hz taper, 20 to 20000
+         -- Logarithmic modulation might feel more natural, but linear based on spec:
+         local range = 19980 -- (20000 - 20)
+         local offset_hz = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_hz, 20, 20000)
+         final_engine_val = modulated_val
+         engine.filterCutoff(target_slot, final_engine_val)
+
+       elseif target_param_name == "filter_q" then -- Q taper, 0.1 to 4.0
+         local range = 3.9 -- (4.0 - 0.1)
+         local offset_q = lfo_wave * amount * (range / 2.0)
+         modulated_val = util.clamp(base_val + offset_q, 0.1, 4.0)
+         final_engine_val = modulated_val
+         engine.filterRQ(target_slot, final_engine_val)
+
+       end -- end parameter type check
+    else
+      -- print("LFO Warning: Target param not found: " .. full_param_id)
+    end -- end base_val check
+
+    ::continue_lfo_loop::
+  end -- end LFO loop
+end
+
+local function setup_lfo_metro()
+  lfo_metro = metro.init()
+  lfo_metro.time = LFO_METRO_RATE
+  lfo_metro.event = update_lfos
+  lfo_metro:start()
+end
+
+
+----------------------------------------------------------------
+-- 12) REDRAW
 ----------------------------------------------------------------
 
 function redraw()
@@ -758,145 +1130,173 @@ function redraw()
   if ui_mode == "sample_select" then
     screen.level(15)
     screen.move(0, 10)
-    -- FIX: Replace util.basename with Lua string matching
-    local dir_display_name = string.match(current_dir, "([^/]+)/*$") or current_dir -- Get last component or full path
+    -- Show only last part of path for brevity
+    local dir_display_name = current_dir
+    if dir_display_name then -- Check current_dir is not nil
+         dir_display_name = string.match(current_dir, "([^/]+)/*$") or current_dir
+    else
+         dir_display_name = "(error)" -- Fallback if dir is nil
+    end
     screen.text("Browse: " .. dir_display_name)
 
-    local top_y = 20
-    local display_count = 5 -- Max items to display at once
-    local scroll_offset = math.max(0, item_idx - display_count) -- Calculate scroll offset
+    local top_y = 22
+    local line_h = 8
+    local display_count = 4 -- Max items to display at once to leave space for labels
+    local scroll_offset = 0
+    if #item_list > 0 then
+         -- Ensure item_idx is valid before calculating offset
+         item_idx = util.clamp(item_idx, 1, #item_list)
+         scroll_offset = math.max(0, item_idx - display_count)
+    end
 
     -- Display directory/file items
     for i = 1, display_count do
-       local list_index = i + scroll_offset
-       if list_index <= #item_list then
-          local item = item_list[list_index]
-          local yy = top_y + (i - 1) * 8
-          if list_index == item_idx then screen.level(15) else screen.level(5) end
-          screen.move(5, yy)
-          -- Indicate directories
-          local prefix = ""
-          if item.type == "dir" then prefix = "/" end
-          if item.type == "up" then prefix = "" end -- No prefix for [..]
-          screen.text(prefix .. item.name)
-       end
+         local list_index = i + scroll_offset
+         if list_index <= #item_list then
+           local item = item_list[list_index]
+           if item then -- Check item exists
+               local yy = top_y + (i - 1) * line_h
+               if list_index == item_idx then screen.level(15) else screen.level(5) end
+               screen.move(5, yy)
+               local prefix = ""
+               if item.type == "dir" then prefix = "/" elseif item.type == "up" then prefix = "" end
+               -- Truncate long names
+               local display_name = item.name or "(invalid item)"
+               if string.len(display_name) > 18 then display_name = string.sub(display_name, 1, 17) .. "…" end
+               screen.text(prefix .. display_name)
+           end
+         end
     end
     -- Scroll indicators
     if scroll_offset > 0 then
-       screen.level(5)
-       screen.move(0, top_y - 4)
-       screen.line(0, top_y - 4, 3, top_y - 4)
-       screen.stroke()
+         screen.level(5)
+         screen.move(0, top_y - 4); screen.line_rel(3, 0); screen.stroke()
     end
-    if scroll_offset + display_count < #item_list then
-       screen.level(5)
-       screen.move(0, top_y + display_count * 8 - 4)
-       screen.line(0, top_y + display_count * 8 - 4, 3, top_y + display_count * 8 - 4)
-       screen.stroke()
+    if #item_list > 0 and scroll_offset + display_count < #item_list then
+         screen.level(5)
+         screen.move(0, top_y + display_count * line_h - 4); screen.line_rel(3, 0); screen.stroke()
     end
 
 
-    local rx = 80
+    local rx = 75 -- X position for slot list
     -- Display Slot selector
     screen.level(15)
-    screen.move(rx, top_y - 10)
+    screen.move(rx, top_y - line_h) -- Label above slots
     screen.text("Load Slot:")
     for s = 1, 3 do
-      local yy = top_y + (s - 1) * 8
+      local yy = top_y + (s - 1) * line_h
       if s == slot_idx then screen.level(15) else screen.level(5) end
       screen.move(rx, yy)
-      -- FIX: Use string.match to get basename for sample display too
-      local sample_path = params:string(s.."sample")
-      local sample_filename = string.match(sample_path, "([^/]+)/*$") or sample_path -- Get basename or full path
-      screen.text(s .. ": " .. sample_filename) -- Show filename only
+      local sample_path = params:string(s.."sample") or "" -- Use string representation or ""
+      local sample_filename = "(empty)"
+      if sample_path ~= "" then
+           sample_filename = string.match(sample_path, "([^/]+)/*$") or sample_path
+      end
+        -- Truncate filename
+      if string.len(sample_filename) > 8 then sample_filename = string.sub(sample_filename, 1, 7) .. "…" end
+      screen.text(s .. ": " .. sample_filename)
     end
 
+    -- Help text at bottom
     screen.level(5)
-    screen.move(0, 58) -- Adjusted y position slightly
-    screen.text("E2: browse | E3: select slot")
-    screen.move(0, 58+8)
-    screen.text("K2: open/load | K3: confirm/load")
+    screen.move(0, 56)
+    screen.text("K1:exit E2:list E3:slot K2/3:ok")
 
 
-  else -- Main UI mode
+  else -- Main UI mode (Squares)
     for i = 1, 3 do
       local x = square_x[i]
       local y = square_y
       local s = square_size
       screen.level(1) -- Dark background for square
-      screen.rect(x, y, s, s)
-      screen.fill()
+      screen.rect(x, y, s, s); screen.fill()
 
       -- Volume Indicator (Vertical bar on left)
-      local vol_db = params:get(i.."volume") or 0
-      local volFrac = util.linlin(-60, 20, 0, 1, vol_db) -- Map dB range to 0-1
+      local vol_db = params:get(i.."volume")
+      if vol_db == nil then vol_db = -60 end -- Default if param missing
+      local volFrac = util.linlin(-60, 20, 0, 1, vol_db)
       volFrac = util.clamp(volFrac, 0, 1)
-
       local bar_width = 4
       local bar_height = s * volFrac
       local bar_x = x
       local bar_y = y + s - bar_height -- Bar grows from bottom
-
-      screen.level(4) -- Dimmed background for bar area
-      screen.rect(bar_x, y, bar_width, s)
-      screen.fill()
-
-      screen.level(15) -- Bright indicator
-      screen.rect(bar_x, bar_y, bar_width, bar_height)
-      screen.fill()
+      screen.level(4); screen.rect(bar_x, y, bar_width, s); screen.fill() -- Background track
+      screen.level(15); screen.rect(bar_x, bar_y, bar_width, bar_height); screen.fill() -- Indicator
 
       -- Seek Indicator (Horizontal bar on bottom)
-      local seek_val = params:get(i.."seek") or 0
-      local seekFrac = util.linlin(0, 100, 0, 1, seek_val) -- Map % to 0-1
+      local seek_val = params:get(i.."seek")
+      if seek_val == nil then seek_val = 0 end
+      local seekFrac = util.linlin(0, 100, 0, 1, seek_val)
       seekFrac = util.clamp(seekFrac, 0, 1)
-
       local hbar_height = 4
       local hbar_width = s * seekFrac
       local hbar_x = x
       local hbar_y = y + s - hbar_height
-
-      screen.level(4) -- Dimmed background for bar area
-      screen.rect(hbar_x, hbar_y, s, hbar_height)
-      screen.fill()
-
-      screen.level(15) -- Bright indicator
-      screen.rect(hbar_x, hbar_y, hbar_width, hbar_height)
-      screen.fill()
+      screen.level(4); screen.rect(hbar_x, hbar_y, s, hbar_height); screen.fill() -- Background track
+      screen.level(15); screen.rect(hbar_x, hbar_y, hbar_width, hbar_height); screen.fill() -- Indicator
     end
   end
   screen.update()
 end
 
 ----------------------------------------------------------------
--- 12) INIT
+-- 13) INIT
 ----------------------------------------------------------------
 
+-- Corrected init function
 function init()
-  setup_params() -- Setup params first to load saved values
+  print("Elle init starting...")
+  -- Ensure params are cleared before setup? Generally not needed unless debugging PSET issues.
+  -- params:clear()
+  setup_params() -- Setup params first to load saved values / defaults
 
   -- Set root directory based on loaded parameter or default
   local br = params:get("browse_root")
+  local validated_root = _path.audio -- Default fallback
+
   if type(br) == "string" and br ~= "" then
-    -- Check if the saved path exists and is a directory
-    if util.file_exists(br) and is_dir(br) then
-       root_dir = br
-    elseif util.file_exists(file_dir_name(br)) and is_dir(file_dir_name(br)) then
-       -- If saved path was a file, use its directory
-       root_dir = file_dir_name(br)
-       params:set("browse_root", root_dir) -- Update param if corrected
-    else
-       root_dir = _path.audio -- Fallback if saved path is invalid
-       params:set("browse_root", root_dir) -- Update param
+    local potential_root = br
+    -- If param looks like a file, try its directory
+    if not is_dir(potential_root) and util.file_exists(potential_root) then
+         potential_root = file_dir_name(potential_root)
     end
-    print("browse_root => " .. root_dir)
+    -- Check if the potential root (original or derived directory) is valid
+    if util.file_exists(potential_root) and is_dir(potential_root) then
+         validated_root = potential_root
+         print("init: Using browse_root: " .. validated_root)
+    else
+         print("init: browse_root param invalid ('"..tostring(br).."'), using default.")
+    end
   else
-    root_dir = _path.audio
-    print("browse_root => (default) " .. root_dir)
-    params:set("browse_root", root_dir) -- Ensure param has default if empty
+    print("init: browse_root param missing or invalid type, using default.")
   end
+
+  -- Set the global root_dir
+  root_dir = validated_root
+  -- Ensure the parameter reflects the actual root being used
+  if params:get("browse_root") ~= root_dir then
+       params:set("browse_root", root_dir)
+  end
+  print("browse_root initialized to: " .. root_dir)
   current_dir = root_dir -- Start Browse from root
 
-  setup_engine() -- Setup engine state based on loaded params
+  setup_engine() -- Send initial gate commands, starts clock for playhead update
   setup_ui_metro() -- Start UI updates
-  -- Initial redraw is handled by metro
+  setup_lfo_metro() -- Start LFO updates <--- ADDED
+  print("Elle init finished.")
+  -- Initial redraw is handled by metro soon after
+end
+
+-- Optional: Cleanup function for when script exits
+function cleanup()
+    print("Elle cleanup...")
+    -- Stop all metros
+    if ui_metro then ui_metro:stop(); ui_metro = nil end
+    if lfo_metro then lfo_metro:stop(); lfo_metro = nil end -- <--- ADDED
+    for i=1,3 do
+       if pingpong_metros[i] then pingpong_metros[i]:stop(); pingpong_metros[i] = nil end
+       if random_seek_metros[i] then random_seek_metros[i]:stop(); random_seek_metros[i] = nil end
+    end
+    -- LFO metros already handled above
+    print("Elle cleanup finished.")
 end
