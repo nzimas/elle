@@ -222,120 +222,257 @@ local function setup_params()
   params:set_action("browse_root", function(file)
     if file and file ~= "" then
       local d = file_dir_name(file)
-      root_dir = d
-      print("browse_root => " .. root_dir)
+      -- Basic validation: check if directory exists
+      if util.file_exists(d) and is_dir(d) then
+         root_dir = d
+         print("browse_root => " .. root_dir)
+      else
+         print("browse_root invalid: " .. d .. ", reverting to default.")
+         root_dir = _path.audio
+         params:set("browse_root", root_dir) -- Update param if corrected
+      end
     else
       root_dir = _path.audio
       print("browse_root => (default) " .. root_dir)
     end
   end)
 
-  params:add_separator("samples")
-  for i = 1, 3 do
-    params:add_file(i.."sample", i.." sample")
-    params:set_action(i.."sample", function(f) engine.read(i, f) end)
+  params:add_separator() -- Separator before groups
 
-    params:add_control(i.."playhead_rate", i.." playhead rate",
+  -- ======================== SLOT 1 PARAMETERS ========================
+  local slot1_param_count = 20 -- Manually count params added below
+  params:add_group("slot1", "Slot 1 Settings", slot1_param_count)
+  do -- Use a block to scope local i = 1
+    local i = 1
+    local sid = i.."" -- String version of slot index for IDs
+
+    -- Unique ID: sid.."sample", Label: "sample"
+    params:add_file(sid.."sample", "sample")
+    params:set_action(sid.."sample", function(f) engine.read(i, f) end)
+
+    -- Unique ID: sid.."playhead_rate", Label: "playhead rate"
+    params:add_control(sid.."playhead_rate", "playhead rate",
       controlspec.new(0, 4, "lin", 0.01, 1.0, "", 0.01/4))
-    params:set_action(i.."playhead_rate", function() update_playhead(i) end)
+    params:set_action(sid.."playhead_rate", function() update_playhead(i) end)
 
-    params:add_option(i.."playhead_direction", i.." direction", {">>", "<<", "<->"}, 1)
-    params:set_action(i.."playhead_direction", function() update_playhead(i) end)
+    -- Unique ID: sid.."playhead_direction", Label: "direction"
+    params:add_option(sid.."playhead_direction", "direction", {">>", "<<", "<->"}, 1)
+    params:set_action(sid.."playhead_direction", function() update_playhead(i) end)
 
-    params:add_taper(i.."volume", i.." volume", -60, 20, 0, 0, "dB")
-    params:set_action(i.."volume", function(v) engine.volume(i, math.pow(10, v/20)) end)
+    -- Unique ID: sid.."volume", Label: "volume"
+    params:add_taper(sid.."volume", "volume", -60, 20, 0, 0, "dB")
+    params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end) -- Use dbamp helper
 
-    params:add_taper(i.."jitter", i.." jitter", 0, 2000, 0, 5, "ms")
-    params:set_action(i.."jitter", function(v) engine.jitter(i, v/1000) end)
+    -- Unique ID: sid.."jitter", Label: "jitter"
+    params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
+    params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
 
-    params:add_taper(i.."size", i.." size", 1, 500, 100, 5, "ms")
-    params:set_action(i.."size", function(v) engine.size(i, v/1000) end)
+    -- Unique ID: sid.."size", Label: "size"
+    params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
+    params:set_action(sid.."size", function(v) engine.size(i, v/1000) end)
 
-    params:add_taper(i.."density", i.." density", 0, 512, 20, 6, "hz")
-    params:set_action(i.."density", function(v) engine.density(i, v) end)
+    -- Unique ID: sid.."density", Label: "density"
+    params:add_taper(sid.."density", "density", 0, 512, 20, 6, "hz")
+    params:set_action(sid.."density", function(v) engine.density(i, v) end)
 
-    params:add_taper(i.."pitch", i.." pitch", -48, 48, 0, 0, "st")
-    params:set_action(i.."pitch", function(v) engine.pitch(i, math.pow(0.5, -v/12)) end)
+    -- Unique ID: sid.."pitch", Label: "pitch"
+    params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
+    -- FIX: Use math.pow for semitone to ratio conversion
+    params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
 
-    params:add_taper(i.."spread", i.." spread", 0, 100, 0, 0, "%")
-    params:set_action(i.."spread", function(v) engine.spread(i, v/100) end)
+    -- Unique ID: sid.."spread", Label: "spread"
+    params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
+    params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
 
-    params:add_taper(i.."fade", i.." fade", 1, 9000, 1000, 3, "ms")
-    params:set_action(i.."fade", function(v) engine.envscale(i, v/1000) end)
+    -- Unique ID: sid.."fade", Label: "fade"
+    params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
+    params:set_action(sid.."fade", function(v) engine.envscale(i, v/1000) end)
 
-    params:add_control(i.."seek", i.." seek",
-      controlspec.new(0, 100, "lin", 0.1, (i==3) and 100 or 0, "%", 0.1/100))
-    params:set_action(i.."seek", function(v) engine.seek(i, v/100) end)
+    -- Unique ID: sid.."seek", Label: "seek"
+    params:add_control(sid.."seek", "seek",
+      controlspec.new(0, 100, "lin", 0.1, 0, "%", 0.1/100)) -- Default 0 for slot 1
+    params:set_action(sid.."seek", function(v) engine.seek(i, v/100) end)
 
-    params:add_option(i.."random_seek", i.." random seek", {"off", "on"}, 1)
-    params:add_control(i.."random_seek_freq_min", i.." rseek freq min",
+    -- Unique ID: sid.."random_seek", Label: "random seek"
+    params:add_option(sid.."random_seek", "random seek", {"off", "on"}, 1)
+
+    -- Unique ID: sid.."random_seek_freq_min", Label: "rseek freq min"
+    params:add_control(sid.."random_seek_freq_min", "rseek freq min",
       controlspec.new(100, 30000, "lin", 100, 500, "ms"))
-    params:add_control(i.."random_seek_freq_max", i.." rseek freq max",
+    params:set_action(sid.."random_seek_freq_min", function(val)
+      local mx = params:get(sid.."random_seek_freq_max")
+      if val > mx then params:set(sid.."random_seek_freq_min", mx) end
+    end)
+
+    -- Unique ID: sid.."random_seek_freq_max", Label: "rseek freq max"
+    params:add_control(sid.."random_seek_freq_max", "rseek freq max",
       controlspec.new(100, 30000, "lin", 100, 2000, "ms"))
-    params:set_action(i.."random_seek_freq_min", function(val)
-      local mx = params:get(i.."random_seek_freq_max")
-      if val > mx then params:set(i.."random_seek_freq_min", mx) end -- Corrected action
+    params:set_action(sid.."random_seek_freq_max", function(val)
+      local mn = params:get(sid.."random_seek_freq_min")
+      if val < mn then params:set(sid.."random_seek_freq_max", mn) end
     end)
-    params:set_action(i.."random_seek_freq_max", function(val)
-      local mn = params:get(i.."random_seek_freq_min")
-      if val < mn then params:set(i.."random_seek_freq_max", mn) end -- Corrected action
-    end)
-    params:set_action(i.."random_seek", function(val)
+
+    -- Action for random_seek toggle (refers to other params within the same slot)
+    params:set_action(sid.."random_seek", function(val)
       if val == 2 then
         if not random_seek_metros[i] then
           random_seek_metros[i] = metro.init()
           random_seek_metros[i].event = function()
-            params:set(i.."seek", math.random() * 100)
-            local tmin = params:get(i.."random_seek_freq_min")
-            local tmax = params:get(i.."random_seek_freq_max")
-            -- No need to check tmax < tmin here, actions handle it
+            params:set(sid.."seek", math.random() * 100)
+            local tmin = params:get(sid.."random_seek_freq_min")
+            local tmax = params:get(sid.."random_seek_freq_max")
             local nxt = math.random(tmin, tmax)
             random_seek_metros[i].time = nxt / 1000
-            -- No need to call start again here, metro repeats automatically
           end
         end
-        -- Set initial time and start
-        local tmin = params:get(i.."random_seek_freq_min")
-        local tmax = params:get(i.."random_seek_freq_max")
-        local nxt = math.random(tmin, tmax)
-        random_seek_metros[i].time = nxt / 1000
+        local tmin_init = params:get(sid.."random_seek_freq_min")
+        local tmax_init = params:get(sid.."random_seek_freq_max")
+        random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000
         random_seek_metros[i]:start()
       else
         if random_seek_metros[i] then random_seek_metros[i]:stop() end
       end
     end)
 
-    params:add_option(i.."pitch_change", i.." pitch change?", {"no", "yes"}, 2)
+    -- Unique ID: sid.."pitch_change", Label: "pitch change?"
+    params:add_option(sid.."pitch_change", "pitch change?", {"no", "yes"}, 2)
 
     local pitch_vals = {}
     for v = -24, 24 do table.insert(pitch_vals, v) end
     local pitch_strs = {}
     for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
-    params:add_option(i.."pitch_rng_min", i.." pitch rng min", pitch_strs, 25) -- index 25 is 0
-    params:add_option(i.."pitch_rng_max", i.." pitch rng max", pitch_strs, 25) -- index 25 is 0
-    params:set_action(i.."pitch_rng_min", function(idx)
-      local mn = pitch_vals[idx]
-      local mx_idx = params:get(i.."pitch_rng_max")
-      local mx = pitch_vals[mx_idx]
-      if mn > mx then
-        params:set(i.."pitch_rng_min", mx_idx)
-      end
-    end)
-    params:set_action(i.."pitch_rng_max", function(idx)
-      local mx = pitch_vals[idx]
-      local mn_idx = params:get(i.."pitch_rng_min")
-      local mn = pitch_vals[mn_idx]
-      if mx < mn then
-        params:set(i.."pitch_rng_max", mn_idx)
-      end
+
+    -- Unique ID: sid.."pitch_rng_min", Label: "pitch rng min"
+    params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25) -- 0 st
+    params:set_action(sid.."pitch_rng_min", function(idx)
+      local mn_idx = idx -- Use the new index being set
+      local mx_idx = params:get(sid.."pitch_rng_max")
+      if mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end
     end)
 
-    params:add_option(i.."filter_change", i.." random filter?", {"no", "yes"}, 1)
-    params:add_taper(i.."filter_cutoff", i.." filter cutoff", 20, 20000, 8000, 0, "Hz")
-    params:set_action(i.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
-    params:add_taper(i.."filter_q", i.." filter Q", 0.1, 4.0, 0.5, 0, "")
-    params:set_action(i.."filter_q", function(v) engine.filterRQ(i, v) end)
-  end
+    -- Unique ID: sid.."pitch_rng_max", Label: "pitch rng max"
+    params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25) -- 0 st
+    params:set_action(sid.."pitch_rng_max", function(idx)
+       local mn_idx = params:get(sid.."pitch_rng_min")
+       local mx_idx = idx -- Use the new index being set
+       if mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end
+    end)
+
+    -- Unique ID: sid.."filter_change", Label: "random filter?"
+    params:add_option(sid.."filter_change", "random filter?", {"no", "yes"}, 1)
+
+    -- Unique ID: sid.."filter_cutoff", Label: "filter cutoff"
+    params:add_taper(sid.."filter_cutoff", "filter cutoff", 20, 20000, 8000, 0, "Hz")
+    params:set_action(sid.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
+
+    -- Unique ID: sid.."filter_q", Label: "filter Q"
+    params:add_taper(sid.."filter_q", "filter Q", 0.1, 4.0, 0.5, 0, "")
+    params:set_action(sid.."filter_q", function(v) engine.filterRQ(i, v) end)
+  end -- End of Slot 1 block
+
+  -- ======================== SLOT 2 PARAMETERS ========================
+  local slot2_param_count = 20
+  params:add_group("slot2", "Slot 2 Settings", slot2_param_count)
+  do -- Use a block to scope local i = 2
+    local i = 2
+    local sid = i..""
+
+    params:add_file(sid.."sample", "sample")
+    params:set_action(sid.."sample", function(f) engine.read(i, f) end)
+    params:add_control(sid.."playhead_rate", "playhead rate", controlspec.new(0, 4, "lin", 0.01, 1.0, "", 0.01/4))
+    params:set_action(sid.."playhead_rate", function() update_playhead(i) end)
+    params:add_option(sid.."playhead_direction", "direction", {">>", "<<", "<->"}, 1)
+    params:set_action(sid.."playhead_direction", function() update_playhead(i) end)
+    params:add_taper(sid.."volume", "volume", -60, 20, -60, 0, "dB") -- Default -60
+    params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
+    params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
+    params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
+    params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
+    params:set_action(sid.."size", function(v) engine.size(i, v/1000) end)
+    params:add_taper(sid.."density", "density", 0, 512, 20, 6, "hz")
+    params:set_action(sid.."density", function(v) engine.density(i, v) end)
+    params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
+    -- FIX: Use math.pow for semitone to ratio conversion
+    params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
+    params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
+    params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
+    params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
+    params:set_action(sid.."fade", function(v) engine.envscale(i, v/1000) end)
+    params:add_control(sid.."seek", "seek", controlspec.new(0, 100, "lin", 0.1, 0, "%", 0.1/100)) -- Default 0
+    params:set_action(sid.."seek", function(v) engine.seek(i, v/100) end)
+    params:add_option(sid.."random_seek", "random seek", {"off", "on"}, 1)
+    params:add_control(sid.."random_seek_freq_min", "rseek freq min", controlspec.new(100, 30000, "lin", 100, 500, "ms"))
+    params:add_control(sid.."random_seek_freq_max", "rseek freq max", controlspec.new(100, 30000, "lin", 100, 2000, "ms"))
+    params:set_action(sid.."random_seek_freq_min", function(val) local mx = params:get(sid.."random_seek_freq_max"); if val > mx then params:set(sid.."random_seek_freq_min", mx) end end)
+    params:set_action(sid.."random_seek_freq_max", function(val) local mn = params:get(sid.."random_seek_freq_min"); if val < mn then params:set(sid.."random_seek_freq_max", mn) end end)
+    params:set_action(sid.."random_seek", function(val) if val == 2 then if not random_seek_metros[i] then random_seek_metros[i] = metro.init(); random_seek_metros[i].event = function() params:set(sid.."seek", math.random() * 100); local tmin = params:get(sid.."random_seek_freq_min"); local tmax = params:get(sid.."random_seek_freq_max"); local nxt = math.random(tmin, tmax); random_seek_metros[i].time = nxt / 1000; end end; local tmin_init = params:get(sid.."random_seek_freq_min"); local tmax_init = params:get(sid.."random_seek_freq_max"); random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000; random_seek_metros[i]:start(); else if random_seek_metros[i] then random_seek_metros[i]:stop() end end end)
+    params:add_option(sid.."pitch_change", "pitch change?", {"no", "yes"}, 2)
+    local pitch_vals = {} for v = -24, 24 do table.insert(pitch_vals, v) end
+    local pitch_strs = {} for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
+    params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25)
+    params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25)
+    params:set_action(sid.."pitch_rng_min", function(idx) local mn_idx = idx; local mx_idx = params:get(sid.."pitch_rng_max"); if mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end end)
+    params:set_action(sid.."pitch_rng_max", function(idx) local mn_idx = params:get(sid.."pitch_rng_min"); local mx_idx = idx; if mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end end)
+    params:add_option(sid.."filter_change", "random filter?", {"no", "yes"}, 1)
+    params:add_taper(sid.."filter_cutoff", "filter cutoff", 20, 20000, 8000, 0, "Hz")
+    params:set_action(sid.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
+    params:add_taper(sid.."filter_q", "filter Q", 0.1, 4.0, 0.5, 0, "")
+    params:set_action(sid.."filter_q", function(v) engine.filterRQ(i, v) end)
+  end -- End of Slot 2 block
+
+
+  -- ======================== SLOT 3 PARAMETERS ========================
+  local slot3_param_count = 20
+  params:add_group("slot3", "Slot 3 Settings", slot3_param_count)
+  do -- Use a block to scope local i = 3
+    local i = 3
+    local sid = i..""
+
+    params:add_file(sid.."sample", "sample")
+    params:set_action(sid.."sample", function(f) engine.read(i, f) end)
+    params:add_control(sid.."playhead_rate", "playhead rate", controlspec.new(0, 4, "lin", 0.01, 1.0, "", 0.01/4))
+    params:set_action(sid.."playhead_rate", function() update_playhead(i) end)
+    params:add_option(sid.."playhead_direction", "direction", {">>", "<<", "<->"}, 1)
+    params:set_action(sid.."playhead_direction", function() update_playhead(i) end)
+    params:add_taper(sid.."volume", "volume", -60, 20, -60, 0, "dB") -- Default -60
+    params:set_action(sid.."volume", function(v) engine.volume(i, util.dbamp(v)) end)
+    params:add_taper(sid.."jitter", "jitter", 0, 2000, 0, 5, "ms")
+    params:set_action(sid.."jitter", function(v) engine.jitter(i, v/1000) end)
+    params:add_taper(sid.."size", "size", 1, 500, 100, 5, "ms")
+    params:set_action(sid.."size", function(v) engine.size(i, v/1000) end)
+    params:add_taper(sid.."density", "density", 0, 512, 20, 6, "hz")
+    params:set_action(sid.."density", function(v) engine.density(i, v) end)
+    params:add_taper(sid.."pitch", "pitch", -48, 48, 0, 0, "st")
+    -- FIX: Use math.pow for semitone to ratio conversion
+    params:set_action(sid.."pitch", function(v) engine.pitch(i, math.pow(2, v/12)) end)
+    params:add_taper(sid.."spread", "spread", 0, 100, 0, 0, "%")
+    params:set_action(sid.."spread", function(v) engine.spread(i, v/100) end)
+    params:add_taper(sid.."fade", "fade", 1, 9000, 1000, 3, "ms")
+    params:set_action(sid.."fade", function(v) engine.envscale(i, v/1000) end)
+    params:add_control(sid.."seek", "seek", controlspec.new(0, 100, "lin", 0.1, 100, "%", 0.1/100)) -- Default 100 for slot 3
+    params:set_action(sid.."seek", function(v) engine.seek(i, v/100) end)
+    params:add_option(sid.."random_seek", "random seek", {"off", "on"}, 1)
+    params:add_control(sid.."random_seek_freq_min", "rseek freq min", controlspec.new(100, 30000, "lin", 100, 500, "ms"))
+    params:add_control(sid.."random_seek_freq_max", "rseek freq max", controlspec.new(100, 30000, "lin", 100, 2000, "ms"))
+    params:set_action(sid.."random_seek_freq_min", function(val) local mx = params:get(sid.."random_seek_freq_max"); if val > mx then params:set(sid.."random_seek_freq_min", mx) end end)
+    params:set_action(sid.."random_seek_freq_max", function(val) local mn = params:get(sid.."random_seek_freq_min"); if val < mn then params:set(sid.."random_seek_freq_max", mn) end end)
+    params:set_action(sid.."random_seek", function(val) if val == 2 then if not random_seek_metros[i] then random_seek_metros[i] = metro.init(); random_seek_metros[i].event = function() params:set(sid.."seek", math.random() * 100); local tmin = params:get(sid.."random_seek_freq_min"); local tmax = params:get(sid.."random_seek_freq_max"); local nxt = math.random(tmin, tmax); random_seek_metros[i].time = nxt / 1000; end end; local tmin_init = params:get(sid.."random_seek_freq_min"); local tmax_init = params:get(sid.."random_seek_freq_max"); random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000; random_seek_metros[i]:start(); else if random_seek_metros[i] then random_seek_metros[i]:stop() end end end)
+    params:add_option(sid.."pitch_change", "pitch change?", {"no", "yes"}, 2)
+    local pitch_vals = {} for v = -24, 24 do table.insert(pitch_vals, v) end
+    local pitch_strs = {} for _, v in ipairs(pitch_vals) do table.insert(pitch_strs, tostring(v)) end
+    params:add_option(sid.."pitch_rng_min", "pitch rng min", pitch_strs, 25)
+    params:add_option(sid.."pitch_rng_max", "pitch rng max", pitch_strs, 25)
+    params:set_action(sid.."pitch_rng_min", function(idx) local mn_idx = idx; local mx_idx = params:get(sid.."pitch_rng_max"); if mn_idx > mx_idx then params:set(sid.."pitch_rng_min", mx_idx) end end)
+    params:set_action(sid.."pitch_rng_max", function(idx) local mn_idx = params:get(sid.."pitch_rng_min"); local mx_idx = idx; if mx_idx < mn_idx then params:set(sid.."pitch_rng_max", mn_idx) end end)
+    params:add_option(sid.."filter_change", "random filter?", {"no", "yes"}, 1)
+    params:add_taper(sid.."filter_cutoff", "filter cutoff", 20, 20000, 8000, 0, "Hz")
+    params:set_action(sid.."filter_cutoff", function(v) engine.filterCutoff(i, v) end)
+    params:add_taper(sid.."filter_q", "filter Q", 0.1, 4.0, 0.5, 0, "")
+    params:set_action(sid.."filter_q", function(v) engine.filterRQ(i, v) end)
+  end -- End of Slot 3 block
+
+  -- ======================== GLOBAL PARAMETERS ========================
+  params:add_separator("Global Settings")
 
   params:add_separator("key & scale")
   local notes = {"C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B"}
@@ -345,10 +482,6 @@ local function setup_params()
   params:add_separator("morphing")
   params:add_option("morph_time", "morph time (ms)", morph_time_options, 1) -- index 1 is 0ms
 
-
-  -- ==============================================================
-  -- == DELAY & DECIMATOR PARAMETERS (MODIFIED FOR L/R) ==
-  -- ==============================================================
 
   params:add_separator("delay Left")
   params:add_taper("delay_time_l", "L delay time", 0.0, 2.0, 0.5, 0, "s")
@@ -386,11 +519,6 @@ local function setup_params()
   params:add_control("decimator_add_r", "R decimator add", controlspec.new(-10, 10, "lin", 0, 0, ""))
   params:set_action("decimator_add_r", function(v) engine.decimator_add_r(v) end)
 
-  -- ==============================================================
-  -- == END OF DELAY/DECIMATOR SECTION ==
-  -- ==============================================================
-
-
   params:add_separator("randomizer")
   params:add_taper("min_jitter", "jitter (min)", 0, 2000, 0, 5, "ms")
   params:add_taper("max_jitter", "jitter (max)", 0, 2000, 500, 5, "ms")
@@ -405,6 +533,7 @@ local function setup_params()
   params:add_taper("min_filter_q", "filter Q (min)", 0.1, 4.0, 0.25, 0, "")
   params:add_taper("max_filter_q", "filter Q (max)", 0.1, 4.0, 1.2, 0, "")
 
+  -- Note: pitch_1..5 params seem unused by randomize() function, perhaps legacy? Kept for now.
   params:add_taper("pitch_1", "pitch (1)", -48, 48, -12, 0, "st")
   params:add_taper("pitch_2", "pitch (2)", -48, 48, -5, 0, "st")
   params:add_taper("pitch_3", "pitch (3)", -48, 48, 0, 0, "st")
@@ -413,15 +542,6 @@ local function setup_params()
 
   params:bang() -- Trigger initial actions for all params
 end
-
-local random_seek_clamp_metro = metro.init(function()
-  for i = 1, 3 do
-    local mn = params:get(i.."random_seek_freq_min")
-    local mx = params:get(i.."random_seek_freq_max")
-    if mn > mx then params:set(i.."random_seek_freq_min", mx) end
-  end
-end, 0.1)
-random_seek_clamp_metro:start()
 
 ----------------------------------------------------------------
 -- 7) RANDOMIZE LOGIC
@@ -635,7 +755,9 @@ function redraw()
   if ui_mode == "sample_select" then
     screen.level(15)
     screen.move(0, 10)
-    screen.text("Browse: " .. util.basename(current_dir)) -- Show only current dir name
+    -- FIX: Replace util.basename with Lua string matching
+    local dir_display_name = string.match(current_dir, "([^/]+)/*$") or current_dir -- Get last component or full path
+    screen.text("Browse: " .. dir_display_name)
 
     local top_y = 20
     local display_count = 5 -- Max items to display at once
@@ -680,13 +802,16 @@ function redraw()
       local yy = top_y + (s - 1) * 8
       if s == slot_idx then screen.level(15) else screen.level(5) end
       screen.move(rx, yy)
-      screen.text(s .. ": " .. (params:string(s.."sample"):gsub("^.+/", ""))) -- Show filename only
+      -- FIX: Use string.match to get basename for sample display too
+      local sample_path = params:string(s.."sample")
+      local sample_filename = string.match(sample_path, "([^/]+)/*$") or sample_path -- Get basename or full path
+      screen.text(s .. ": " .. sample_filename) -- Show filename only
     end
 
     screen.level(5)
-    screen.move(0, 60)
+    screen.move(0, 58) -- Adjusted y position slightly
     screen.text("E2: browse | E3: select slot")
-    screen.move(0, 60+8)
+    screen.move(0, 58+8)
     screen.text("K2: open/load | K3: confirm/load")
 
 
