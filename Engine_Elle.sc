@@ -5,11 +5,13 @@ Engine_Elle : CroneEngine {
 	var <delaySynthL; // Delay synth for Left channel
 	var <delaySynthR; // Delay synth for Right channel
 	var <drySynth;    // Synth to pass through dry signal
+	var <globalPitchShiftSynth; // Synth for global pitch shifting before delays
 
 	var <buffersL;
 	var <buffersR;
 	var <voices;
 	var mixBus; // Bus for voices output, before effects
+	var pitchShiftedBus; // Bus for pitch-shifted signal feeding delays
 	var <phases;
 	var <levels;
 
@@ -44,7 +46,6 @@ Engine_Elle : CroneEngine {
 					});
 				},{
 					// If mono, use the same buffer for the right channel input of GrainBuf
-					// Need to wait for the first buffer to be confirmed loaded? No, set directly.
 					voices[i].set(\buf_r, newbuf); // Use the handle from the first read
 					buffersR[i].free; // Free the placeholder buffer
 					buffersR[i] = newbuf; // Keep track of the shared buffer
@@ -69,7 +70,7 @@ Engine_Elle : CroneEngine {
 			);
 		});
 
-		// SynthDef for granular voices (Unchanged from original)
+		// --- MODIFIED: SynthDef for granular voices (PitchShift removed) ---
 		SynthDef(\synth, {
 			arg out, phase_out, level_out,
 				buf_l, buf_r,
@@ -78,15 +79,8 @@ Engine_Elle : CroneEngine {
 				freeze=0, t_reset_pos=0,
 
 				// per-voice resonant filter
-				filterFreq=8000, filterRQ=0.5,
-
-				// PitchShift arguments
-				shiftWindow=0.1,
-				shiftRatio=1.0,
-				shiftPitchDispersion=0.0,
-				shiftTimeDispersion=0.0,
-				shiftMul=1.0,
-				shiftAdd=0.0;
+				filterFreq=8000, filterRQ=0.5;
+				// Removed PitchShift arguments
 
 			var grain_trig, jitter_sig, buf_dur, pan_sig;
 			var buf_pos, pos_sig, sig_l, sig_r, sig_mix, env, level;
@@ -127,16 +121,7 @@ Engine_Elle : CroneEngine {
 			// Combine L/R with per‐voice panning
 			sig_mix = Balance2.ar(sig_l, sig_r, pan + pan_sig);
 
-			// PitchShift inserted immediately after granular voices
-			sig_mix = PitchShift.ar(
-				sig_mix,
-				shiftWindow,
-				shiftRatio,
-				shiftPitchDispersion,
-				shiftTimeDispersion,
-				shiftMul,
-				shiftAdd
-			);
+			// --- PitchShift was here, now removed ---
 
 			// Per-voice resonant filter
 			sig_mix = RLPF.ar(sig_mix, filterFreq, filterRQ);
@@ -151,14 +136,40 @@ Engine_Elle : CroneEngine {
 			Out.kr(level_out, level);
 		}).add;
 
-		// --- NEW: SynthDef for dry signal pass-through ---
+		// --- NEW: SynthDef for global pitch shifting ---
+		SynthDef(\globalPitchShift, {
+			arg in=0, out=0,
+				shiftWindow=0.1,
+				shiftRatio=1.0,
+				shiftPitchDispersion=0.0,
+				shiftTimeDispersion=0.0,
+				shiftMul=1.0,
+				shiftAdd=0.0;
+
+			var sig = In.ar(in, 2); // Read stereo signal from input bus
+
+			sig = PitchShift.ar(
+				sig,
+				shiftWindow,
+				shiftRatio,
+				shiftPitchDispersion,
+				shiftTimeDispersion,
+				shiftMul,
+				shiftAdd
+			);
+
+			Out.ar(out, sig); // Write stereo pitch-shifted signal to output bus
+		}).add;
+
+
+		// --- SynthDef for dry signal pass-through (Unchanged) ---
 		SynthDef(\thru, {
 			arg in, out;
 			var sig = In.ar(in, 2); // Read stereo signal from input bus
 			Out.ar(out, sig);       // Write stereo signal to output bus
 		}).add;
 
-		// --- MODIFIED: Mono Delay SynthDef with panning ---
+		// --- Mono Delay SynthDef with panning (Unchanged) ---
 		SynthDef(\monoDelay, {
 			arg in, out, pan = 0, // Added pan argument
 				delayTime=0.5, feedback=0.5, mix=0.5, maxDelay=2.0,
@@ -201,38 +212,54 @@ Engine_Elle : CroneEngine {
 
 		// mix bus for all synth outputs (stereo)
 		mixBus = Bus.audio(context.server, 2);
+		// --- NEW: Bus for pitch-shifted signal ---
+		pitchShiftedBus = Bus.audio(context.server, 2);
 
-		// --- NEW: Instantiate dry signal pass-through ---
-		// Placed at the tail of the effect group to run after voice group output
+		// Group for synth voices (runs first)
+		pg = ParGroup.head(context.xg);
+
+		// --- NEW: Instantiate global pitch shifter ---
+		// Reads from mixBus, writes to pitchShiftedBus. Runs *after* voices.
+		globalPitchShiftSynth = Synth.after(pg, \globalPitchShift, [
+			\in, mixBus.index,
+			\out, pitchShiftedBus.index,
+			// Initial pitch shift parameters (can be set via commands)
+			\shiftWindow, 0.1,
+			\shiftRatio, 1.0,
+			\shiftPitchDispersion, 0.0,
+			\shiftTimeDispersion, 0.0,
+			\shiftMul, 1.0,
+			\shiftAdd, 0.0
+		]);
+
+		// --- Instantiate dry signal pass-through ---
+		// Placed at the tail. Reads from mixBus (un-shifted).
 		drySynth = Synth.tail(context.xg, \thru, [
 			\in, mixBus.index,
 			\out, context.out_b.index // Main output
 		]);
 
-		// --- NEW: Instantiate Left Delay ---
-		// Reads Left channel from mixBus (index), outputs panned left
+		// --- MODIFIED: Instantiate Left Delay ---
+		// Reads Left channel from pitchShiftedBus, outputs panned left
 		delaySynthL = Synth.tail(context.xg, \monoDelay, [
-			\in, mixBus.index,       // Reads Left channel (bus index)
-			\out, context.out_b.index, // Main output start index
-			\pan, -1                 // Pan hard left
-			// Add initial parameter settings if needed, e.g., \delayTime, 0.3
+			\in, pitchShiftedBus.index,      // Reads Left channel from PITCH SHIFTED bus
+			\out, context.out_b.index,     // Main output start index
+			\pan, -1                       // Pan hard left
+			// Add initial delay parameter settings if needed
 		]);
 
-		// --- NEW: Instantiate Right Delay ---
-		// Reads Right channel from mixBus (index + 1), outputs panned right
+		// --- MODIFIED: Instantiate Right Delay ---
+		// Reads Right channel from pitchShiftedBus, outputs panned right
 		delaySynthR = Synth.tail(context.xg, \monoDelay, [
-			\in, mixBus.index + 1,   // Reads Right channel (bus index + 1)
-			\out, context.out_b.index, // Main output start index
-			\pan, 1                  // Pan hard right
-			// Add initial parameter settings if needed, e.g., \delayTime, 0.4
+			\in, pitchShiftedBus.index + 1,  // Reads Right channel from PITCH SHIFTED bus
+			\out, context.out_b.index,     // Main output start index
+			\pan, 1                        // Pan hard right
+			// Add initial delay parameter settings if needed
 		]);
 
 		// Control buses for phase and level (Unchanged)
 		phases = Array.fill(nvoices, { arg i; Bus.control(context.server); });
 		levels = Array.fill(nvoices, { arg i; Bus.control(context.server); });
-
-		// Group for synth voices (Unchanged)
-		pg = ParGroup.head(context.xg); // Voices run first
 
 		// Instantiate granular voices (Unchanged, output to mixBus)
 		voices = Array.fill(nvoices, { arg i;
@@ -244,7 +271,7 @@ Engine_Elle : CroneEngine {
 				\buf_r, buffersR[i],
 				\filterFreq, 8000,
 				\filterRQ, 0.5
-				// Initial pitch shift etc. can be set here too
+				// Removed initial pitch shift args
 			], target: pg); // Add voices to their own group
 		});
 
@@ -267,15 +294,14 @@ Engine_Elle : CroneEngine {
 
 			lvl = levels[voice].getSynchronous(); // Check current level (optional use)
 
-			// Simplified instant seek - advanced routine commented out in original
+			// Simplified instant seek
 			pos = msg[2];
 			voices[voice].set(\pos, pos); // Set the new position directly
 			voices[voice].set(\t_reset_pos, 1); // Trigger phasor reset
 			voices[voice].set(\freeze, 0); // Ensure playback is active
-
 		});
 
-		// Voice parameter commands (Unchanged)
+		// Voice parameter commands (Unchanged, pitch shift commands removed below)
 		this.addCommand("gate", "ii", { arg msg; voices[msg[1]-1].set(\gate, msg[2]); });
 		this.addCommand("speed", "if", { arg msg; voices[msg[1]-1].set(\speed, msg[2]); });
 		this.addCommand("jitter", "if", { arg msg; voices[msg[1]-1].set(\jitter, msg[2]); });
@@ -288,15 +314,27 @@ Engine_Elle : CroneEngine {
 		this.addCommand("envscale", "if", { arg msg; voices[msg[1]-1].set(\envscale, msg[2]); });
 		this.addCommand("filterCutoff", "if", { arg msg; voices[msg[1]-1].set(\filterFreq, msg[2]); });
 		this.addCommand("filterRQ", "if", { arg msg; voices[msg[1]-1].set(\filterRQ, msg[2]); });
+
+		// --- REMOVED: Per-voice pitch shift commands ---
+		/*
 		this.addCommand("ps_windowSize", "if", { arg msg; voices[msg[1]-1].set(\shiftWindow, msg[2]); });
 		this.addCommand("ps_pitchRatio", "if", { arg msg; voices[msg[1]-1].set(\shiftRatio, msg[2]); });
 		this.addCommand("ps_pitchDispersion", "if", { arg msg; voices[msg[1]-1].set(\shiftPitchDispersion, msg[2]); });
 		this.addCommand("ps_timeDispersion", "if", { arg msg; voices[msg[1]-1].set(\shiftTimeDispersion, msg[2]); });
 		this.addCommand("ps_mul", "if", { arg msg; voices[msg[1]-1].set(\shiftMul, msg[2]); });
 		this.addCommand("ps_add", "if", { arg msg; voices[msg[1]-1].set(\shiftAdd, msg[2]); });
+		*/
+
+		// --- NEW: Global pitch shift commands ---
+		this.addCommand("global_ps_windowSize", "f", { arg msg; globalPitchShiftSynth.set(\shiftWindow, msg[1]); });
+		this.addCommand("global_ps_pitchRatio", "f", { arg msg; globalPitchShiftSynth.set(\shiftRatio, msg[1]); });
+		this.addCommand("global_ps_pitchDispersion", "f", { arg msg; globalPitchShiftSynth.set(\shiftPitchDispersion, msg[1]); });
+		this.addCommand("global_ps_timeDispersion", "f", { arg msg; globalPitchShiftSynth.set(\shiftTimeDispersion, msg[1]); });
+		this.addCommand("global_ps_mul", "f", { arg msg; globalPitchShiftSynth.set(\shiftMul, msg[1]); });
+		this.addCommand("global_ps_add", "f", { arg msg; globalPitchShiftSynth.set(\shiftAdd, msg[1]); });
 
 
-		// --- MODIFIED/NEW: Delay parameter commands ---
+		// --- Delay parameter commands (Unchanged) ---
 
 		// Left Delay Commands
 		this.addCommand("delay_time_l", "f", { arg msg; delaySynthL.set(\delayTime, msg[1]); });
@@ -307,7 +345,7 @@ Engine_Elle : CroneEngine {
 		this.addCommand("decimator_mul_l", "f", { arg msg; delaySynthL.set(\deciMul, msg[1]); });
 		this.addCommand("decimator_add_l", "f", { arg msg; delaySynthL.set(\deciAdd, msg[1]); });
 
-		// Right Delay Commands (New)
+		// Right Delay Commands
 		this.addCommand("delay_time_r", "f", { arg msg; delaySynthR.set(\delayTime, msg[1]); });
 		this.addCommand("delay_feedback_r", "f", { arg msg; delaySynthR.set(\feedback, msg[1]); });
 		this.addCommand("delay_mix_r", "f", { arg msg; delaySynthR.set(\mix, msg[1]); });
@@ -337,14 +375,17 @@ Engine_Elle : CroneEngine {
 
 		// Free audio buffers
 		buffersL.do({ arg b; b.free; });
-		// Note: buffersR might contain references to buffersL if mono files were loaded
-		// SuperCollider's Buffer.free handles freeing only once if referenced multiple times.
-		buffersR.do({ arg b; b.free; });
+		buffersR.do({ arg b; b.free; }); // SC handles freeing only once if shared
 
+		// Free synths (in reverse order of typical dependency)
 		delaySynthL.free;
 		delaySynthR.free;
 		drySynth.free;
+		globalPitchShiftSynth.free; // Free the new synth
+
+		// Free buses
 		mixBus.free;
+		pitchShiftedBus.free; // Free the new bus
 
 		// Stop any running seek tasks
 		seek_tasks.do(_.stop);
