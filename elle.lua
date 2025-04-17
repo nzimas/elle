@@ -1,5 +1,6 @@
 -- |_ (Elle)
 -- by @nzimas
+-- Adapted for Global Pitch Shift
 
 engine.name = "Elle"
 
@@ -66,6 +67,7 @@ local slot_lfo_target_param_names = {
 -- Targetable parameter names for FX LFOs (relative to their FX block)
 local delay_lfo_target_param_names = { "time", "feedback", "mix" }
 local decimator_lfo_target_param_names = { "rate", "bits", "mul", "add" }
+-- NOTE: Global Pitch Shift parameters are NOT currently LFO targets
 
 local lfo_shape_names = {"sine", "tri", "saw", "sqr", "random"}
 
@@ -217,7 +219,7 @@ local function list_dir_contents(dir)
         else
           local lower = string.lower(f)
           if string.match(lower, "%.wav$") or string.match(lower, "%.aif$") or
-                     string.match(lower, "%.aiff$") or string.match(lower, "%.flac$") then
+                           string.match(lower, "%.aiff$") or string.match(lower, "%.flac$") then
             table.insert(files, {type = "file", name = f, path = p})
           end
         end
@@ -312,7 +314,7 @@ end
 
 
 ----------------------------------------------------------------
--- 5) PITCH RANDOMIZATION
+-- 5) PITCH RANDOMIZATION (Unchanged - Operates on per-slot pitch param)
 ----------------------------------------------------------------
 
 local function random_float(mn, mx)
@@ -422,11 +424,11 @@ local function setup_params()
 
     -- If the browser is currently open, reset its view to the new root
     if ui_mode == "sample_select" then
-        print("Browser open, resetting current_dir to new root.")
-        current_dir = root_dir
-        item_idx = 1
-        refresh_dir_contents()
-        redraw()
+       print("Browser open, resetting current_dir to new root.")
+       current_dir = root_dir
+       item_idx = 1
+       refresh_dir_contents()
+       redraw()
     end
   end)
 
@@ -487,7 +489,9 @@ local function setup_params()
 
 
   -- ======================== SLOT 1 PARAMETERS ========================
-  local base_slot1_param_count = 21 -- Original count before LFOs
+  -- NOTE: The original script had 21 base params BEFORE LFOs, but the per-voice pitch shift params
+  -- were not included in the lua script. So the count remains 21 + LFOs.
+  local base_slot1_param_count = 21
   local slot1_param_count = base_slot1_param_count + slot_lfo_group_size
   params:add_group("slot1", "Slot 1 Settings", slot1_param_count)
   do -- Use a block to scope local i = 1
@@ -567,8 +571,8 @@ local function setup_params()
         local tmin_init = params:get(sid.."random_seek_freq_min")
         local tmax_init = params:get(sid.."random_seek_freq_max")
         if tmin_init ~= nil and tmax_init ~= nil then
-            random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000
-            random_seek_metros[i]:start()
+           random_seek_metros[i].time = math.random(tmin_init, tmax_init) / 1000
+           random_seek_metros[i]:start()
         end
       else -- "off"
         if random_seek_metros[i] then
@@ -805,6 +809,32 @@ local function setup_params()
       add_fx_lfo_params(prefix, name_prefix, decimator_lfo_target_param_names)
   end
 
+  -- ======================== NEW GLOBAL PITCH SHIFT PARAMETERS ========================
+  local global_ps_count = 6 -- Six parameters for the global pitch shifter
+  params:add_group("global_pitch_shift", "Global Pitch Shift", global_ps_count)
+  do
+    local prefix = "global_ps_"
+    local name_prefix = "Global PS "
+
+    params:add_taper(prefix .. "windowSize", name_prefix .. "Window", 0.01, 1.0, 0.1, 0, "s")
+    params:set_action(prefix .. "windowSize", function(v) engine.global_ps_windowSize(v) end)
+
+    params:add_control(prefix .. "pitchRatio", name_prefix .. "Ratio", controlspec.new(0.25, 1.0, "exp", 0.01, 1.0, "ratio"))
+    params:set_action(prefix .. "pitchRatio", function(v) engine.global_ps_pitchRatio(v) end)
+
+    params:add_control(prefix .. "pitchDispersion", name_prefix .. "Pitch Disp.", controlspec.new(0.0, 1.0, "lin", 0.01, 0.0, ""))
+    params:set_action(prefix .. "pitchDispersion", function(v) engine.global_ps_pitchDispersion(v) end)
+
+    params:add_control(prefix .. "timeDispersion", name_prefix .. "Time Disp.", controlspec.new(0.0, 0.2, "lin", 0.001, 0.0, "s")) -- Max 200ms dispersion
+    params:set_action(prefix .. "timeDispersion", function(v) engine.global_ps_timeDispersion(v) end)
+
+    params:add_control(prefix .. "mul", name_prefix .. "Mul", controlspec.new(0.0, 4.0, "lin", 0.01, 1.0, ""))
+    params:set_action(prefix .. "mul", function(v) engine.global_ps_mul(v) end)
+
+    params:add_control(prefix .. "add", name_prefix .. "Add", controlspec.new(-1.0, 1.0, "lin", 0.01, 0.0, ""))
+    params:set_action(prefix .. "add", function(v) engine.global_ps_add(v) end)
+  end
+
   -- ======================== RANDOMIZER PARAMETERS ========================
   params:add_separator("Randomizer Settings") -- Separator for clarity
   local randomizer_param_count = 17 -- Old count, including legacy pitch
@@ -835,7 +865,7 @@ end
 
 
 ----------------------------------------------------------------
--- 7) RANDOMIZE LOGIC
+-- 7) RANDOMIZE LOGIC (Unchanged)
 ----------------------------------------------------------------
 
 local function randomize(slot)
@@ -843,8 +873,8 @@ local function randomize(slot)
   if not params:get("morph_time") or
      not params:get("min_jitter") or not params:get("max_jitter") or
      not params:get(slot.."jitter") or not params:get(slot.."seek") or not params:get(slot.."pan") then
-      print("Error: Cannot randomize slot " .. slot .. " - required params missing.")
-      return
+     print("Error: Cannot randomize slot " .. slot .. " - required params missing.")
+     return
   end
 
   local morph_time_idx = params:get("morph_time")
@@ -863,7 +893,7 @@ local function randomize(slot)
   smooth_transition(s.."density", new_density, morph_duration)
   smooth_transition(s.."spread", new_spread, morph_duration)
 
-  -- Randomize pitch if enabled
+  -- Randomize pitch if enabled (using the slot's pitch quantization settings)
   if params:get(s.."pitch_change") == 2 then -- "yes"
     local new_pitch = get_random_pitch(slot)
     smooth_transition(s.."pitch", new_pitch, morph_duration)
@@ -887,7 +917,7 @@ local function randomize(slot)
 end
 
 ----------------------------------------------------------------
--- 8) INIT / ENGINE
+-- 8) INIT / ENGINE (Unchanged logic, relies on params:bang())
 ----------------------------------------------------------------
 
 local function setup_engine()
@@ -918,7 +948,7 @@ local function setup_engine()
 end
 
 ----------------------------------------------------------------
--- 9) SAMPLE-SELECT UI FUNCTIONS
+-- 9) SAMPLE-SELECT UI FUNCTIONS (Unchanged)
 ----------------------------------------------------------------
 
 local function refresh_dir_contents()
@@ -981,11 +1011,11 @@ local function confirm_sample_select()
     ui_mode = "main" -- Exit sample select after loading
     redraw()
   elseif it.type == "dir" or it.type == "up" then
-      -- If K3 pressed on a directory or '..', open it (same as K2)
-      current_dir = it.path
-      item_idx = 1 -- Reset item index
-      refresh_dir_contents()
-      redraw() -- Update browser view, stay in sample select mode
+     -- If K3 pressed on a directory or '..', open it (same as K2)
+     current_dir = it.path
+     item_idx = 1 -- Reset item index
+     refresh_dir_contents()
+     redraw() -- Update browser view, stay in sample select mode
   else
     -- If "none" type item selected, just exit
     -- print("confirm_sample_select: selection is not a file or directory.")
@@ -995,7 +1025,7 @@ local function confirm_sample_select()
 end
 
 ----------------------------------------------------------------
--- 10) KEY / ENC HANDLING
+-- 10) KEY / ENC HANDLING (Unchanged)
 ----------------------------------------------------------------
 
 -- Corrected key function
@@ -1075,7 +1105,7 @@ function enc(n, d)
 end
 
 ----------------------------------------------------------------
--- 11) LFO LOGIC
+-- 11) LFO LOGIC (Unchanged - Does not target new pitch shift params)
 ----------------------------------------------------------------
 
 local function update_lfos()
@@ -1098,7 +1128,7 @@ local function update_lfos()
 
         -- Safety checks for missing params
         if target_param_idx == nil or rate == nil or shape_idx == nil then
-            goto continue_slot_lfo_loop
+           goto continue_slot_lfo_loop
         end
 
         local target_param_name = slot_lfo_target_param_names[target_param_idx]
@@ -1244,8 +1274,8 @@ local function update_lfos()
 
           -- Skip if LFO amount is negligible
           if amount == nil or amount < 0.001 then
-              fx_lfo_values[block_key][lfo_num] = 0 -- Ensure value is reset
-              goto continue_fx_lfo_loop -- Skip to the next LFO in this block
+             fx_lfo_values[block_key][lfo_num] = 0 -- Ensure value is reset
+             goto continue_fx_lfo_loop -- Skip to the next LFO in this block
           end
 
           -- Get LFO parameters
@@ -1255,7 +1285,7 @@ local function update_lfos()
 
           -- Safety checks
           if target_param_idx == nil or rate == nil or shape_idx == nil then
-              goto continue_fx_lfo_loop
+             goto continue_fx_lfo_loop
           end
 
           local target_param_name = target_param_name_list[target_param_idx] -- e.g., "time", "feedback"
@@ -1264,8 +1294,8 @@ local function update_lfos()
 
           -- Check if we found a valid target param name and engine function
           if not target_param_name or not engine_function then
-              -- print("FX LFO Warning: Invalid target param index or name for " .. lfo_param_id_prefix)
-              goto continue_fx_lfo_loop
+             -- print("FX LFO Warning: Invalid target param index or name for " .. lfo_param_id_prefix)
+             goto continue_fx_lfo_loop
           end
 
           -- Update phase
@@ -1359,7 +1389,7 @@ end
 
 
 ----------------------------------------------------------------
--- 12) REDRAW
+-- 12) REDRAW (Unchanged)
 ----------------------------------------------------------------
 
 function redraw()
@@ -1477,7 +1507,7 @@ function redraw()
 end
 
 ----------------------------------------------------------------
--- 13) INIT
+-- 13) INIT (Unchanged logic)
 ----------------------------------------------------------------
 
 -- Corrected init function
